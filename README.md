@@ -10,6 +10,13 @@ Execute tasks from task files using DAG-based dependency resolution with persist
 - **Reflection system**: Each task produces a reflection for downstream tasks
 - **Retry with backoff**: Failed tasks retry with exponential backoff
 - **Multiple formats**: Supports Fio README, simple checkboxes, and YAML
+- **Chat progress**: Real-time progress messages in Pi chat via `pi.sendMessage`
+- **Tool usage tracking**: Detects and reports tool usage (read, write, edit, bash) from task execution
+- **Git commit capture**: Captures git commit messages and generates summaries per task
+- **Configurable timeouts**: Task-level timeouts via meta blocks, with global fallback
+- **Session saving**: Saves full task output for expandable session review
+- **Resume auto-discovery**: Automatically finds and resumes interrupted execution
+- **Custom message renderer**: Compact UI labels with expandable details in Pi TUI
 
 ## Usage
 
@@ -76,8 +83,20 @@ maxParallel: 3
 projectContext: "Additional context for all tasks"
 ```
 
+### Task-Level Timeout
+
+You can set a timeout for individual tasks using a meta block in the task file:
+
+```markdown
+- [ ] 01: Setup project structure
+  timeout: 10m
+```
+
+Supported formats: `10m` (minutes), `600s` (seconds), `3600000` (milliseconds)
+
 ## State Files
 
 - `.ralph/progress.json` - Execution progress
 - `.ralph/reflections/` - Per-task reflections
 - `.ralph/prompts/` - Generated prompts
+- `.ralph/sessions/` - Full task output for review
