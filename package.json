@@ -1,0 +1,17 @@
+{
+  "name": "ralph-loop",
+  "version": "1.0.0",
+  "description": "Execute tasks from task files using DAG-based dependency resolution with persistent progress tracking",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "dependencies": {
+    "yaml": "^2.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  }
+}
