@@ -338,6 +338,7 @@ export async function runAgentSession(
 	timeoutMs: number,
 	onEvent?: (event: AgentSessionEvent) => void,
 	signal?: AbortSignal,
+	sessionFile?: string,
 ): Promise<{
 	success: boolean;
 	text: string;
@@ -353,7 +354,12 @@ export async function runAgentSession(
 		bash: 0,
 		other: 0,
 	};
-	const recordedEvents: AgentSessionEvent[] = [];
+	// Stream events to file instead of accumulating in memory.
+	// Accumulating caused "Invalid string length" crashes when
+	// JSON.stringify(output.events, null, 2) produced 300+ MB strings.
+	const eventStream = sessionFile
+		? fs.createWriteStream(sessionFile, { flags: "a" })
+		: null;
 
 	// Wire timeout via abort signal
 	const timeoutHandle = setTimeout(() => {
@@ -393,7 +399,10 @@ export async function runAgentSession(
 		let stopReason: string | undefined;
 
 		const unsubscribe = result.session.subscribe((event) => {
-			recordedEvents.push(event);
+			// Stream event to file (avoids accumulating 300+ MB in memory)
+			if (eventStream) {
+				eventStream.write(JSON.stringify(event) + "\n");
+			}
 			onEvent?.(event);
 
 			if (event.type === "message_end") {
@@ -430,6 +439,11 @@ export async function runAgentSession(
 		signal?.removeEventListener("abort", abortHandler);
 		clearTimeout(timeoutHandle);
 
+		// Flush and close the event stream before returning
+		if (eventStream) {
+			await new Promise<void>((resolve) => eventStream.end(resolve));
+		}
+
 		if (errorMessage && !finalText) {
 			return {
 				success: false,
@@ -437,7 +451,7 @@ export async function runAgentSession(
 				error: errorMessage,
 				toolUsage,
 				stopReason,
-				events: recordedEvents,
+				events: [], // streamed to file
 			};
 		}
 
@@ -446,16 +460,19 @@ export async function runAgentSession(
 			text: finalText.trim(),
 			toolUsage,
 			stopReason,
-			events: recordedEvents,
+			events: [], // streamed to file
 		};
 	} catch (error) {
 		clearTimeout(timeoutHandle);
+		if (eventStream && !eventStream.destroyed) {
+			eventStream.end();
+		}
 		return {
 			success: false,
 			text: "",
 			error: error instanceof Error ? error.message : String(error),
 			toolUsage,
-			events: recordedEvents,
+			events: [], // streamed to file
 		};
 	} finally {
 		sessionRef.session?.dispose();

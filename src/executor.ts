@@ -5,6 +5,7 @@ import type { ProgressTracker } from "./progress";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildTaskPrompt } from "./prompts";
 import { extractReflection } from "./reflection";
+import { WidgetBatcher } from "./widget-batcher";
 import {
 	runAgentSession,
 	writeFileSafe,
@@ -39,6 +40,7 @@ export async function runTask(
 	ctx: ExtensionContext,
 	sendChatMessage?: SendChatMessage,
 	projectDir: string = project.sourceDir,
+	batcher?: WidgetBatcher,
 ): Promise<{
 	success: boolean;
 	reflection?: Reflection;
@@ -104,7 +106,11 @@ export async function runTask(
 			}
 		}
 
-		ctx.ui.setWidget(widgetKey, lines);
+		if (batcher) {
+			batcher.schedule(widgetKey, lines);
+		} else {
+			ctx.ui.setWidget(widgetKey, lines);
+		}
 	};
 
 	// Smooth spinner animation at 100ms intervals
@@ -118,6 +124,11 @@ export async function runTask(
 
 	// Use task-level timeout if set, otherwise fall back to config
 	const timeoutMs = task.timeoutMs ?? config.execution.timeoutMs;
+
+	// Pre-create session file path so events stream to disk (avoids 300+ MB in-memory accumulation)
+	const sessionsDir = path.join(ralphDir, "sessions");
+	ensureDir(sessionsDir);
+	const sessionFilePath = path.join(sessionsDir, `${task.id}-${startMs}.txt`);
 
 	// Run task asynchronously via Pi SDK — event loop stays responsive
 	const output = await runAgentSession(
@@ -134,13 +145,19 @@ export async function runTask(
 				updateWidget();
 			}
 		},
+		undefined, // no abort signal
+		sessionFilePath, // stream events to file
 	);
 
 	const durationMs = Date.now() - startMs;
 
 	// Clear progress widget and status after task finishes
 	clearInterval(spinnerTimer);
-	ctx.ui.setWidget(widgetKey, undefined);
+	if (batcher) {
+		batcher.scheduleRemove(widgetKey);
+	} else {
+		ctx.ui.setWidget(widgetKey, undefined);
+	}
 	ctx.ui.setStatus("ralph", undefined);
 
 	if (!output.success) {
@@ -150,6 +167,7 @@ export async function runTask(
 			success: false,
 			error: output.error,
 			durationMs,
+			sessionFile: sessionFilePath, // events streamed to file for debugging
 		};
 	}
 
@@ -159,12 +177,8 @@ export async function runTask(
 	// Capture git commits made during this task
 	const { commitMessages, commitSummary } = captureGitCommits(projectDir);
 
-	// Save full session transcript to .ralph/sessions/
-	const sessionFile = saveSessionOutput(
-		projectDir,
-		task.id,
-		JSON.stringify(output.events, null, 2),
-	);
+	// Session file already written by runAgentSession (events streamed to disk)
+	const sessionFile = sessionFilePath;
 
 	// Build output preview (first 500 chars of agent text)
 	const outputPreview =
@@ -189,21 +203,6 @@ export async function runTask(
 		commitMessages,
 		commitSummary,
 	};
-}
-
-// ─── Save Session Output ────────────────────────────────────────────────────
-
-function saveSessionOutput(
-	sourceDir: string,
-	taskId: string,
-	output: string,
-): string {
-	const sessionsDir = path.join(sourceDir, ".ralph", "sessions");
-	ensureDir(sessionsDir);
-	const fileName = `${taskId}-${Date.now()}.txt`;
-	const filePath = path.join(sessionsDir, fileName);
-	writeFileSafe(filePath, output);
-	return filePath;
 }
 
 // ─── Execute Batch ───────────────────────────────────────────────────────────
@@ -272,6 +271,7 @@ async function executeBatchParallel(
 	projectDir?: string,
 ): Promise<void> {
 	const maxParallel = config.execution.maxParallel;
+	const batcher = new WidgetBatcher(ctx);
 	const results: Array<{ task: Task; result: Promise<any> }> = [];
 
 	for (const task of tasks) {
@@ -285,6 +285,7 @@ async function executeBatchParallel(
 				ctx,
 				sendChatMessage,
 				projectDir,
+				batcher,
 			),
 		});
 
@@ -299,6 +300,9 @@ async function executeBatchParallel(
 	for (const { result } of results) {
 		await result;
 	}
+
+	// Flush and stop the batcher after all tasks complete
+	batcher.stop();
 }
 
 // ─── Execute Single Task with Retry ──────────────────────────────────────────
@@ -311,6 +315,7 @@ async function executeTask(
 	ctx: ExtensionContext,
 	sendChatMessage?: SendChatMessage,
 	projectDir: string = project.sourceDir,
+	batcher?: WidgetBatcher,
 ): Promise<void> {
 	const maxRetries = config.execution.maxRetries;
 	let retries = 0;
@@ -334,6 +339,7 @@ async function executeTask(
 				ctx,
 				sendChatMessage,
 				projectDir,
+				batcher,
 			);
 
 			if (result.success) {

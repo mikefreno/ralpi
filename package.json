@@ -3,12 +3,37 @@
   "version": "1.0.0",
   "description": "Execute tasks from task files using DAG-based dependency resolution with persistent progress tracking",
   "main": "dist/index.js",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "task-runner",
+    "dag",
+    "task-manager"
+  ],
+  "author": "",
+  "license": "MIT",
+  "files": [
+    "dist/",
+    "skills/",
+    "prompts/",
+    "index.ts"
+  ],
   "scripts": {
     "build": "tsc",
-    "watch": "tsc --watch"
+    "watch": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "pi": {
+    "extensions": ["./dist/index.js"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"]
   },
   "dependencies": {
     "yaml": "^2.4.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

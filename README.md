@@ -1,4 +1,4 @@
-# ralph-loop
+# Ralpi
 
 Execute tasks from task files using DAG-based dependency resolution with persistent progress tracking.
 
