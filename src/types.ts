@@ -153,6 +153,8 @@ export interface RalpiConfig {
 		timeoutMs: number;
 		/** Maximum parallel tasks (0 = unlimited) */
 		maxParallel: number;
+		/** Round-robin model list for parallel tasks (empty = inherit parent model) */
+		models: string[];
 	};
 	prompts: {
 		/** Additional context injected into every task prompt */
@@ -176,6 +178,7 @@ export const DEFAULT_CONFIG: RalpiConfig = {
 		retryDelayMs: 0,
 		timeoutMs: 0, // 0 = inherit Pi's own defaults (no ralpi-level timeout)
 		maxParallel: 3,
+		models: [],
 	},
 	prompts: {
 		projectContext: "",

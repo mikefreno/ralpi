@@ -108,12 +108,20 @@ Create config files. Both are optional:
 ```yaml
 execution:
   maxParallel: 3          # ralpi-level concurrency only
+  models:                 # round-robin in <provider>/<model> format
+    - google/gemini-3.5-flash # 1st and 3rd task in parallel
+    - openai/gpt-5.5 # 2nd task in parallel
 prompts:
   projectContext: "Additional context for all tasks"
 ```
 
 > ralpi deliberately does **not** set timeouts or retries — those are inherited
 > from Pi's own settings. Tasks run until they complete or Pi's own flow stops them.
+>
+> `execution.models` uses slot-aware round-robin: with 3 models and 2 concurrent
+> tasks, only the first two models are used. The third model is only touched when
+> a third concurrent task starts. Freed model slots are reused before new ones
+> are allocated.
 
 The keys mirror the nested structure of `RalpiConfig` in `src/types.ts`.
 

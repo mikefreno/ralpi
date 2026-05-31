@@ -220,6 +220,16 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 		},
 	);
 
+	// Register the extension's prompts/ directory so Pi discovers @task-manager
+	pi.on("resources_discover", async (_event, _ctx) => {
+		const promptsDir = fs.existsSync(path.resolve(__dirname, "prompts"))
+			? path.resolve(__dirname, "prompts")
+			: path.resolve(__dirname, "..", "prompts");
+		return {
+			promptPaths: [promptsDir],
+		};
+	});
+
 	pi.registerCommand("ralpi", {
 		description:
 			"Execute tasks from a task file using DAG-based dependency resolution",

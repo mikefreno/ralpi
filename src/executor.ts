@@ -34,6 +34,53 @@ const MAX_COLLAPSED = 3;
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+// ─── Model Round-Robin ─────────────────────────────────────────────────────
+
+/**
+ * Round-robin model assignment with slot reuse.
+ *
+ * With models [A, B, C] and 2 concurrent tasks, only A and B are used.
+ * Model C is only touched when a third concurrent task starts.
+ * Freed slots are reused before new slots are allocated.
+ */
+class ModelRoundRobin {
+	private models: unknown[];
+	private freeSlots: number[];
+	private nextIndex = 0;
+	private assignments = new Map<string, number>();
+
+	constructor(models: unknown[]) {
+		this.models = models;
+		this.freeSlots = [];
+	}
+
+	assign(taskId: string): unknown {
+		let index: number;
+		if (this.freeSlots.length > 0) {
+			// Reuse a freed model slot first
+			index = this.freeSlots.shift()!;
+		} else if (this.nextIndex < this.models.length) {
+			// Allocate a new slot
+			index = this.nextIndex++;
+		} else {
+			// All models in use — wrap around
+			index = this.nextIndex % this.models.length;
+			this.nextIndex++;
+		}
+		this.assignments.set(taskId, index);
+		return this.models[index];
+	}
+
+	release(taskId: string): void {
+		const index = this.assignments.get(taskId);
+		if (index !== undefined) {
+			this.freeSlots.push(index);
+			this.freeSlots.sort((a, b) => a - b);
+			this.assignments.delete(taskId);
+		}
+	}
+}
+
 /** Shared state for parallel-batch widget. Each running task writes its
  *  tool calls and spinner frame; the batch widget reads them in task-ID order. */
 interface ParallelWidgetEntry {
@@ -61,6 +108,7 @@ export async function runTask(
 	sendChatMessage?: SendChatMessage,
 	projectDir: string = project.sourceDir,
 	parallelState?: ParallelWidgetState,
+	assignedModel?: unknown,
 ): Promise<{
 	success: boolean;
 	reflection?: Reflection;
@@ -190,7 +238,7 @@ export async function runTask(
 		},
 		undefined, // no abort signal
 		sessionFilePath, // stream events to file
-		config.model,
+		assignedModel ?? config.model,
 		config.thinkingLevel,
 	);
 
@@ -275,6 +323,37 @@ export async function executeBatch(
 		);
 	}
 
+	// Set up model round-robin if configured.
+	// Config entries are "<provider>/<model>" strings — resolve via modelRegistry.
+	let roundRobin: ModelRoundRobin | null = null;
+	if (config.execution.models.length > 0) {
+		const resolvedModels: unknown[] = [];
+		for (const entry of config.execution.models) {
+			const slashIdx = entry.indexOf("/");
+			if (slashIdx === -1) {
+				ctx.ui.notify(
+					`ralpi config: skipping model "${entry}" — expected <provider>/<model> format`,
+					"warning",
+				);
+				continue;
+			}
+			const provider = entry.slice(0, slashIdx);
+			const modelId = entry.slice(slashIdx + 1);
+			const resolved = ctx.modelRegistry?.find(provider, modelId);
+			if (resolved) {
+				resolvedModels.push(resolved);
+			} else {
+				ctx.ui.notify(
+					`ralpi config: model "${entry}" not found in registry — skipping`,
+					"warning",
+				);
+			}
+		}
+		if (resolvedModels.length > 0) {
+			roundRobin = new ModelRoundRobin(resolvedModels);
+		}
+	}
+
 	// Check if we should run parallel
 	const shouldParallel =
 		options?.parallel && tasks.length > 1 && config.execution.maxParallel > 0;
@@ -288,12 +367,14 @@ export async function executeBatch(
 			ctx,
 			sendChatMessage,
 			projectDir,
+			roundRobin,
 		);
 		return;
 	}
 
 	// Execute sequentially
 	for (const task of tasks) {
+		const model = roundRobin?.assign(task.id);
 		await executeTask(
 			task,
 			project,
@@ -302,7 +383,10 @@ export async function executeBatch(
 			ctx,
 			sendChatMessage,
 			projectDir,
+			undefined,
+			model,
 		);
+		roundRobin?.release(task.id);
 	}
 }
 
@@ -317,6 +401,7 @@ async function executeBatchParallel(
 	ctx: ExtensionContext,
 	sendChatMessage?: SendChatMessage,
 	projectDir?: string,
+	roundRobin?: ModelRoundRobin | null,
 ): Promise<void> {
 	const maxParallel = config.execution.maxParallel;
 	const sharedState: ParallelWidgetState = new Map();
@@ -385,6 +470,7 @@ async function executeBatchParallel(
 	const results: Array<{ task: Task; result: Promise<any> }> = [];
 
 	for (const task of tasks) {
+		const assignedModel = roundRobin?.assign(task.id);
 		results.push({
 			task,
 			result: executeTask(
@@ -396,7 +482,8 @@ async function executeBatchParallel(
 				sendChatMessage,
 				projectDir,
 				sharedState,
-			),
+				assignedModel,
+			).finally(() => roundRobin?.release(task.id)),
 		});
 
 		// Limit concurrency
@@ -426,6 +513,7 @@ async function executeTask(
 	sendChatMessage?: SendChatMessage,
 	projectDir: string = project.sourceDir,
 	parallelState?: ParallelWidgetState,
+	assignedModel?: unknown,
 ): Promise<void> {
 	const maxRetries = config.execution.maxRetries;
 	let retries = 0;
@@ -450,6 +538,7 @@ async function executeTask(
 				sendChatMessage,
 				projectDir,
 				parallelState,
+				assignedModel,
 			);
 
 			if (result.success) {
