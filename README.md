@@ -113,10 +113,11 @@ prompts:
 > tasks, only the first two models are used. The third model is only touched when
 > a third concurrent task starts. Freed model slots are reused before new ones
 > are allocated.
->
 > **Automatic failover**: if a provider/API is unreachable (rate limit, 503, etc.),
 > the task automatically cycles to the next model in the list without counting it
 > as a task failure. Each model is tried once before the task is marked as failed.
+> **NOTE**: this is only used in parallel execution, in sequential mode the
+> parent pi session's model is used
 
 ## State Files
 

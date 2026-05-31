@@ -411,10 +411,9 @@ export async function executeBatch(
 		return;
 	}
 
-	// Execute sequentially
+	// Execute sequentially (no round-robin — inherit parent model)
 	for (const task of tasks) {
 		try {
-			const model = roundRobin?.assign(task.id);
 			await executeTask(
 				task,
 				project,
@@ -423,14 +422,11 @@ export async function executeBatch(
 				ctx,
 				sendChatMessage,
 				projectDir,
-				undefined,
-				model,
-				roundRobin,
 			);
 		} catch (error) {
 			// Task failed — stop the batch. Dependent tasks are blocked by
 			// the DAG layer (getBlockedTasks) so they won't appear in this batch.
-			roundRobin?.release(task.id);
+
 			const errorMsg = error instanceof Error ? error.message : String(error);
 			progress.markFailed(task.id, errorMsg);
 			sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${errorMsg}`);
