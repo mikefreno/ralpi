@@ -2,7 +2,7 @@ import * as path from "node:path";
 import type { Task, Project, Reflection, ToolUsage } from "./types";
 import type { RalphConfig } from "./types";
 import type { ProgressTracker } from "./progress";
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildTaskPrompt } from "./prompts";
 import { extractReflection } from "./reflection";
 import {
@@ -36,7 +36,7 @@ export async function runTask(
 	project: Project,
 	config: RalphConfig,
 	depReflections: Reflection[],
-	ctx: ExtensionCommandContext,
+	ctx: ExtensionContext,
 	sendChatMessage?: SendChatMessage,
 	projectDir: string = project.sourceDir,
 ): Promise<{
@@ -210,16 +210,22 @@ function saveSessionOutput(
  * Execute a batch of tasks (sequentially or in parallel)
  */
 export async function executeBatch(
-	_batchIndex: number,
 	tasks: Task[],
 	project: Project,
 	config: RalphConfig,
 	progress: ProgressTracker,
-	ctx: ExtensionCommandContext,
+	ctx: ExtensionContext,
 	options?: { parallel?: boolean },
 	sendChatMessage?: SendChatMessage,
 	projectDir?: string,
 ): Promise<void> {
+	// Defensive: ensure tasks is an iterable array
+	if (!Array.isArray(tasks)) {
+		throw new Error(
+			`executeBatch received invalid tasks: expected array, got ${typeof tasks}`,
+		);
+	}
+
 	// Check if we should run parallel
 	const shouldParallel =
 		options?.parallel && tasks.length > 1 && config.execution.maxParallel > 0;
@@ -259,7 +265,7 @@ async function executeBatchParallel(
 	project: Project,
 	config: RalphConfig,
 	progress: ProgressTracker,
-	ctx: ExtensionCommandContext,
+	ctx: ExtensionContext,
 	sendChatMessage?: SendChatMessage,
 	projectDir?: string,
 ): Promise<void> {
@@ -300,7 +306,7 @@ async function executeTask(
 	project: Project,
 	config: RalphConfig,
 	progress: ProgressTracker,
-	ctx: ExtensionCommandContext,
+	ctx: ExtensionContext,
 	sendChatMessage?: SendChatMessage,
 	projectDir: string = project.sourceDir,
 ): Promise<void> {

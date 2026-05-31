@@ -99,7 +99,7 @@ function parseFioFormat(
 					.map((t) => t.trim())
 					.filter((t) => t)
 					.map((t) => `0${t}`);
-				
+
 				// Each target depends on the source
 				for (const toId of targetIds) {
 					if (!dependencies[toId]) dependencies[toId] = [];
@@ -117,7 +117,7 @@ function parseFioFormat(
 					.map((t) => t.trim())
 					.filter((t) => t)
 					.map((t) => `0${t}`);
-				
+
 				if (!dependencies[taskIdPadded]) dependencies[taskIdPadded] = [];
 				dependencies[taskIdPadded].push(...depIds);
 			}
