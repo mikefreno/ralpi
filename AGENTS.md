@@ -4,18 +4,17 @@
 
 A Pi coding agent extension that registers the `/ralpi` slash command. Not a standalone app — it runs inside Pi's extension host.
 
-## Build
+## Type checking
 
 ```
-npm run build    # tsc → dist/
-npm run watch    # tsc --watch
+npm run typecheck    # tsc --noEmit
 ```
 
-No bundler, no linter, no test framework. Plain `tsc` with strict mode.
+No build step needed — Pi loads extensions via [jiti](https://github.com/unjs/jiti), which compiles TypeScript at runtime. `index.ts` is the entry point directly.
 
 ## Entry point
 
-`index.ts` at repo root (not `src/`). Exports a default function receiving `ExtensionAPI`. The `tsconfig.json` sets `rootDir: "./"` so `index.ts` compiles to `dist/index.js`.
+`index.ts` at repo root (not `src/`). Exports a default function receiving `ExtensionAPI`.
 
 ## External dependencies
 

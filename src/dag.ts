@@ -1,5 +1,33 @@
 import type { Task, ExecutionBatch, ExecutionPlan, Project } from "./types";
 
+// ─── Blocked Tasks ───────────────────────────────────────────────────────────
+
+/**
+ * Find tasks that are blocked (direct or transitive) due to failed dependencies.
+ * Returns a Set of blocked task IDs.
+ */
+export function getBlockedTasks(
+	pendingTasks: Task[],
+	failedTaskIds: Set<string>,
+): Set<string> {
+	const blocked = new Set<string>();
+
+	let changed = true;
+	while (changed) {
+		changed = false;
+		for (const task of pendingTasks) {
+			if (blocked.has(task.id)) continue;
+			const deps = task.dependencies || [];
+			if (deps.some((dep) => failedTaskIds.has(dep))) {
+				blocked.add(task.id);
+				changed = true;
+			}
+		}
+	}
+
+	return blocked;
+}
+
 // ─── Main Entry ──────────────────────────────────────────────────────────────
 
 /**
@@ -10,16 +38,15 @@ export function buildExecutionPlan(
 	project: Project,
 	completed: Set<string>,
 	parallelGroup?: number,
+	failedTaskIds: Set<string> = new Set(),
 ): ExecutionPlan {
-	const allTasks = new Map(project.tasks.map((t) => [t.id, t]));
-
 	// Filter out already completed tasks
 	const pendingTasks = project.tasks.filter((t) => !completed.has(t.id));
 
 	// If parallel_group is explicitly set, use group-based batching
 	if (parallelGroup !== undefined) {
 		return {
-			batches: buildParallelGroupBatches(pendingTasks, allTasks, completed),
+			batches: buildParallelGroupBatches(pendingTasks, failedTaskIds),
 			totalTasks: pendingTasks.length,
 			skippedTasks: project.tasks.filter((t) => completed.has(t.id)),
 		};
@@ -27,7 +54,7 @@ export function buildExecutionPlan(
 
 	// Use dependency-based Kahn's algorithm
 	return {
-		batches: buildBatches(pendingTasks, allTasks, completed),
+		batches: buildBatches(pendingTasks, failedTaskIds),
 		totalTasks: pendingTasks.length,
 		skippedTasks: project.tasks.filter((t) => completed.has(t.id)),
 	};
@@ -41,9 +68,18 @@ export function buildExecutionPlan(
 export function buildSequentialPlan(
 	project: Project,
 	completed: Set<string>,
+	failedTaskIds: Set<string> = new Set(),
 ): ExecutionPlan {
 	const pendingTasks = project.tasks.filter((t) => !completed.has(t.id));
-	const batches: ExecutionBatch[] = pendingTasks.map((task, i) => ({
+
+	// Mark tasks with failed dependencies as skipped
+	const blocked = getBlockedTasks(pendingTasks, failedTaskIds);
+	const skippedTasks = project.tasks.filter(
+		(t) => completed.has(t.id) || blocked.has(t.id),
+	);
+	const activeTasks = pendingTasks.filter((t) => !blocked.has(t.id));
+
+	const batches: ExecutionBatch[] = activeTasks.map((task, i) => ({
 		tasks: [task],
 		batchIndex: i,
 	}));
@@ -51,7 +87,7 @@ export function buildSequentialPlan(
 	return {
 		batches,
 		totalTasks: pendingTasks.length,
-		skippedTasks: project.tasks.filter((t) => completed.has(t.id)),
+		skippedTasks,
 	};
 }
 
@@ -59,12 +95,15 @@ export function buildSequentialPlan(
 
 function buildBatches(
 	pendingTasks: Task[],
-	allTasks: Map<string, Task>,
-	completed: Set<string>,
+	failedTaskIds: Set<string>,
 ): ExecutionBatch[] {
 	const batches: ExecutionBatch[] = [];
-	const done = new Set(completed);
-	const remaining = new Set(pendingTasks.map((t) => t.id));
+	const done = new Set<string>();
+	const blocked = getBlockedTasks(pendingTasks, failedTaskIds);
+	const pendingSet = new Set(pendingTasks.map((t) => t.id));
+	const remaining = new Set(
+		pendingTasks.filter((t) => !blocked.has(t.id)).map((t) => t.id),
+	);
 
 	while (remaining.size > 0) {
 		// Find tasks whose dependencies are all satisfied
@@ -74,7 +113,7 @@ function buildBatches(
 
 			const deps = task.dependencies || [];
 			const depsSatisfied = deps.every(
-				(dep) => done.has(dep) || !allTasks.has(dep),
+				(dep) => done.has(dep) || !pendingSet.has(dep),
 			);
 
 			if (depsSatisfied) {
@@ -108,12 +147,14 @@ function buildBatches(
  */
 function buildParallelGroupBatches(
 	pendingTasks: Task[],
-	allTasks: Map<string, Task>,
-	completed: Set<string>,
+	failedTaskIds: Set<string>,
 ): ExecutionBatch[] {
+	const blocked = getBlockedTasks(pendingTasks, failedTaskIds);
+	const activeTasks = pendingTasks.filter((t) => !blocked.has(t.id));
+
 	const groups = new Map<number, Task[]>();
 
-	for (const task of pendingTasks) {
+	for (const task of activeTasks) {
 		const group = task.parallelGroup ?? 0;
 		if (!groups.has(group)) groups.set(group, []);
 		groups.get(group)!.push(task);
@@ -121,7 +162,7 @@ function buildParallelGroupBatches(
 
 	const sortedGroups = Array.from(groups.entries()).sort((a, b) => a[0] - b[0]);
 
-	return sortedGroups.map(([groupNum, tasks], i) => ({
+	return sortedGroups.map(([_groupNum, tasks], i) => ({
 		tasks,
 		batchIndex: i,
 	}));

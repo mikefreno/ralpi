@@ -11,6 +11,7 @@ import {
   buildSequentialPlan,
   formatExecutionPlan,
   getReadyTasks,
+  getBlockedTasks,
 } from "./src/dag";
 import { ProgressTracker } from "./src/progress";
 import { buildPlanPrompt } from "./src/prompts";
@@ -69,7 +70,7 @@ async function selectExecutionMode(
   config: import("./src/types").RalpiConfig,
 ): Promise<ExecutionMode> {
   const mode = await ctx.ui.select("Execution mode for this run?", [
-    `Parallel (where dependencies allow)-[${config.execution.maxParallel} max]`,
+    `Parallel (where dependencies allow)[${config.execution.maxParallel} max]`,
     "Sequential (one at a time)",
   ]);
   const isParallel = mode?.startsWith("Parallel") ?? false;
@@ -125,6 +126,9 @@ async function executePlanBatches(
   sendChatMessage?: SendChatMessage,
   projectDir?: string,
 ): Promise<void> {
+  // Track failed task IDs across batches to block downstream tasks
+  const failedTaskIds = new Set(progress.getFailedTaskIds());
+
   for (const batch of plan.batches) {
     if (progress.getState().paused) {
       ctx.ui.notify(
@@ -156,6 +160,43 @@ async function executePlanBatches(
     for (const task of batch.tasks) {
       const status = progress.getTaskStatus(task.id);
       updateTaskInFile(taskFile, task.id, status);
+    }
+
+    // Update failed task IDs after batch completes
+    const newFailed = progress.getFailedTaskIds();
+    for (const id of newFailed) {
+      failedTaskIds.add(id);
+    }
+
+    // In sequential mode, stop after any failure
+    if (mode === "sequential" && failedTaskIds.size > 0) {
+      break;
+    }
+
+    // In parallel mode, rebuild the plan to filter out newly blocked tasks
+    if (mode === "parallel") {
+      const completed = new Set(progress.getCompletedTaskIds());
+      const newPlan = buildExecutionPlan(
+        project,
+        completed,
+        undefined,
+        failedTaskIds,
+      );
+
+      // Replace remaining batches with filtered ones
+      const currentIdx = plan.batches.indexOf(batch);
+      const remainingBatches = newPlan.batches.filter(
+        (b) => b.batchIndex > currentIdx,
+      );
+
+      // Update the plan's batches in-place
+      plan.batches.length = 0;
+      plan.batches.push(...remainingBatches);
+
+      // Skip empty batches
+      if (remainingBatches.length === 0) {
+        break;
+      }
     }
   }
 }
