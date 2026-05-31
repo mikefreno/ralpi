@@ -26,7 +26,7 @@ The only real npm dependency is `yaml` (^2.4.0).
 
 ## Source structure
 
-- `index.ts` — extension entry, command routing, UI registration
+- `index.ts` — extension entry, command routing, UI registration, reload detection
 - `src/` — all logic modules:
   - `parser.ts` — task file parsing (Fio, checkbox, YAML formats)
   - `dag.ts` — Kahn's algorithm dependency resolution, batch planning
@@ -37,12 +37,13 @@ The only real npm dependency is `yaml` (^2.4.0).
   - `utils.ts` — config loading, progress discovery, `runAgentSession()`
   - `types.ts` — all interfaces and `DEFAULT_CONFIG`
   - `widget-batcher.ts` — debounced widget updates for parallel tasks
+  - `constants.ts` — static constants
 - `skills/ralpi-use.md` — Pi skill definition for task execution
-- `tasks/` — example ralpi task files (self-modification history)
+- `prompts/task-manager.md` — Pi prompt for task planning
 
 ## Runtime state
 
-All runtime state lives in `.ralpi/` (gitignored):
+All runtime state lives in `.ralpi/` in the **project directory** (not this extension directory):
 - `.ralpi/progress.json` — execution progress, supports multiple PRDs
 - `.ralpi/reflections/` — per-task reflection JSON files
 - `.ralpi/prompts/` — generated prompts (timestamped, for debugging)

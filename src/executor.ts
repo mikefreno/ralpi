@@ -500,7 +500,9 @@ async function executeBatchParallel(
 				truncateToWidth(`${frame} ${entry.taskHeader}`, effectiveWidth),
 			);
 
-			if (entry.toolCalls.length > 0) {
+			// Only show tool calls for in-progress tasks; completed/failed
+			// tasks already have their tool-call tree in the chat history message.
+			if (!entry.done && entry.toolCalls.length > 0) {
 				if (entry.toolCalls.length <= MAX_COLLAPSED) {
 					for (let i = 0; i < entry.toolCalls.length; i++) {
 						const tc = entry.toolCalls[i];

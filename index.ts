@@ -202,18 +202,15 @@ async function executePlanBatches(
 					failedTaskIds,
 				);
 
-				// Replace remaining batches with filtered ones
-				const currentIdx = plan.batches.indexOf(batch);
-				const remainingBatches = newPlan.batches.filter(
-					(b) => b.batchIndex > currentIdx,
-				);
+				// Keep processed batches (up to current batch), replace the rest
+				// with the fresh plan — its batchIndex restarts at 0, so filtering
+				// by batchIndex > currentIdx would incorrectly drop the next batch.
+				const processedCount = plan.batches.indexOf(batch) + 1;
+				plan.batches.length = processedCount;
+				plan.batches.push(...newPlan.batches);
 
-				// Update the plan's batches in-place
-				plan.batches.length = 0;
-				plan.batches.push(...remainingBatches);
-
-				// Skip empty batches
-				if (remainingBatches.length === 0) {
+				// Skip if nothing remaining
+				if (plan.batches.length === processedCount) {
 					break;
 				}
 			}
