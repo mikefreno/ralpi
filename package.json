@@ -1,6 +1,6 @@
 {
   "name": "@mikefreno/ralpi",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Execute tasks from task files/PRD's using DAG-based dependency resolution with persistent progress tracking",
   "keywords": [
     "pi-package",
