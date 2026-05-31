@@ -2,6 +2,20 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Task, Project } from "./types";
 
+// Lazy-loaded yaml package
+let YAML_module: typeof import("yaml") | undefined;
+function loadYaml(): typeof import("yaml") {
+	if (YAML_module) return YAML_module;
+	try {
+		YAML_module = require("yaml");
+	} catch {
+		throw new Error(
+			"YAML parsing requires the 'yaml' package. Run: npm install yaml",
+		);
+	}
+	return YAML_module!;
+}
+
 // ─── Main Entry ──────────────────────────────────────────────────────────────
 
 /**
@@ -75,7 +89,7 @@ function parseFioFormat(
 				const [, status, id, title, file] = match;
 				const timeoutMs = parseTimeoutFromLine(line);
 				tasks.push({
-					id: `0${id}`,
+					id: id.padStart(2, "0"),
 					title: title.trim(),
 					description: undefined,
 					file: file || undefined,
@@ -96,12 +110,12 @@ function parseFioFormat(
 			);
 			if (arrowMatch) {
 				const [, from, targets] = arrowMatch;
-				const fromId = `0${from}`;
+				const fromId = from.padStart(2, "0");
 				const targetIds = targets
 					.split(",")
 					.map((t) => t.trim())
 					.filter((t) => t)
-					.map((t) => `0${t}`);
+					.map((t) => t.padStart(2, "0"));
 
 				// Each target depends on the source
 				for (const toId of targetIds) {
@@ -117,12 +131,12 @@ function parseFioFormat(
 			);
 			if (dependsMatch) {
 				const [, taskId, depsList] = dependsMatch;
-				const taskIdPadded = `0${taskId}`;
+				const taskIdPadded = taskId.padStart(2, "0");
 				const depIds = depsList
 					.split(",")
 					.map((t) => t.trim())
 					.filter((t) => t)
-					.map((t) => `0${t}`);
+					.map((t) => t.padStart(2, "0"));
 
 				if (!dependencies[taskIdPadded]) dependencies[taskIdPadded] = [];
 				dependencies[taskIdPadded].push(...depIds);
@@ -134,7 +148,7 @@ function parseFioFormat(
 			);
 			if (metaMatch) {
 				const [, taskId, value, unit] = metaMatch;
-				const task = tasks.find((t) => t.id === `0${taskId}`);
+				const task = tasks.find((t) => t.id === taskId.padStart(2, "0"));
 				if (task) {
 					task.timeoutMs = parseTimeoutValue(Number(value), unit);
 				}
@@ -210,16 +224,7 @@ function parseYaml(
 	sourcePath: string,
 	sourceDir: string,
 ): Project {
-	// Lazy-load yaml (may not be installed)
-	let YAML: typeof import("yaml");
-	try {
-		YAML = require("yaml");
-	} catch {
-		throw new Error(
-			"YAML parsing requires the 'yaml' package. Run: npm install yaml",
-		);
-	}
-
+	const YAML = loadYaml();
 	const doc = YAML.parse(content);
 	const tasks: Task[] = [];
 
@@ -263,35 +268,108 @@ export function readTaskSpec(taskDir: string, taskFile: string): string {
 // ─── Task File Updater ───────────────────────────────────────────────────────
 
 /**
- * Update task status in the source markdown file
+ * Update task status in the source file (markdown or YAML).
+ *
+ * Handles three formats:
+ * 1. Fio numbered format: `- [ ] 01 – Title` — matches by task number in the file
+ * 2. Simple checkbox: `- [ ] Title` — matches by checkbox position (index)
+ * 3. YAML: uses `yaml` library to parse, update, and stringify
  */
 export function updateTaskInFile(
 	filePath: string,
 	taskId: string,
 	status: Task["status"],
 ): void {
-	let content = fs.readFileSync(filePath, "utf-8");
-	const char = statusToChar(status);
+	const ext = path.extname(filePath).toLowerCase();
 
-	// Try Fio numbered format first
-	const fioPattern = new RegExp(
-		`(^-\\s+\\[)(.)(\\]\\s+${escapeRegex(taskId)}\\s*[—–-])`,
-		"m",
-	);
-	if (fioPattern.test(content)) {
-		content = content.replace(fioPattern, `$1${char}$3`);
-		fs.writeFileSync(filePath, content, "utf-8");
+	// Handle YAML format
+	if (ext === ".yaml" || ext === ".yml") {
+		updateTaskInYaml(filePath, taskId, status);
 		return;
 	}
 
-	// Try simple checkbox format
-	const simplePattern = new RegExp(
-		`(-\\s+\\[)(.)(\\]\\s+${escapeRegex(taskId)})`,
-		"m",
-	);
-	if (simplePattern.test(content)) {
-		content = content.replace(simplePattern, `$1${char}$3`);
-		fs.writeFileSync(filePath, content, "utf-8");
+	let content = fs.readFileSync(filePath, "utf-8");
+	const char = statusToChar(status);
+
+	// Strategy 1: Fio numbered format — match by explicit task ID in the file
+	// Try both padded (01) and raw (1) variations
+	const rawId = parseInt(taskId, 10).toString();
+	const idPatterns = new Set([escapeRegex(taskId), escapeRegex(rawId)]);
+
+	for (const idPattern of idPatterns) {
+		const fioRegex = new RegExp(
+			`(^-\\s+\\[)(.)(\\]\\s+${idPattern}\\s*[—–:-])`,
+			"m",
+		);
+		const match = content.match(fioRegex);
+		if (match) {
+			content = content.replace(fioRegex, `$1${char}$3`);
+			fs.writeFileSync(filePath, content, "utf-8");
+			return;
+		}
+	}
+
+	// Strategy 2: Simple checkbox by position (task IDs are zero-padded indices)
+	const targetIndex = parseInt(taskId, 10);
+	if (!isNaN(targetIndex)) {
+		const lines = content.split("\n");
+		let checkboxIdx = 0;
+		for (let i = 0; i < lines.length; i++) {
+			const m = lines[i].match(/^(\s*-+\s+\[)(.)(\].*)$/);
+			if (m) {
+				if (checkboxIdx === targetIndex) {
+					lines[i] = m[1] + char + m[3];
+					fs.writeFileSync(filePath, lines.join("\n"), "utf-8");
+					return;
+				}
+				checkboxIdx++;
+			}
+		}
+	}
+}
+
+/**
+ * Update task status in a YAML task file using the yaml library's
+ * Document API, which preserves comments and formatting.
+ *
+ * Matches by explicit `id` field first, then falls back to
+ * position-based matching (for files without explicit IDs).
+ */
+function updateTaskInYaml(
+	filePath: string,
+	taskId: string,
+	status: Task["status"],
+): void {
+	const YAML = loadYaml();
+	const content = fs.readFileSync(filePath, "utf-8");
+	const doc = YAML.parseDocument(content);
+	const tasks = doc.get("tasks");
+	if (!tasks || !YAML.isSeq(tasks)) return;
+
+	const rawId = parseInt(taskId, 10).toString();
+
+	// Strategy 1: Match by explicit id field
+	for (const item of tasks.items) {
+		if (!YAML.isMap(item)) continue;
+		const idVal = item.get("id");
+		if (idVal === undefined || idVal === null) continue;
+		const idStr = String(idVal);
+		if (idStr === taskId || idStr === rawId) {
+			item.set("status", status);
+			fs.writeFileSync(filePath, String(doc), "utf-8");
+			return;
+		}
+	}
+
+	// Strategy 2: Fall back to position-based matching
+	// (for YAML files without explicit id fields)
+	const targetIndex = parseInt(taskId, 10);
+	if (!isNaN(targetIndex) && targetIndex < tasks.items.length) {
+		const item = tasks.items[targetIndex];
+		if (YAML.isMap(item)) {
+			item.set("status", status);
+			fs.writeFileSync(filePath, String(doc), "utf-8");
+		}
 	}
 }
 

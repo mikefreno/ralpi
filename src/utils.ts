@@ -34,6 +34,78 @@ export function writeFileSafe(filePath: string, content: string): void {
 	fs.writeFileSync(filePath, content, "utf-8");
 }
 
+// ─── Loop-Active State ──────────────────────────────────────────────────────
+
+/**
+ * State persisted to disk when a ralpi execution loop is active.
+ * Used to re-instantiate widgets after a session reload.
+ */
+export interface LoopActiveState {
+	taskFile: string;
+	mode: "parallel" | "sequential";
+	startedAt: string;
+	taskIds: string[];
+	prdKey: string;
+}
+
+/**
+ * Path (relative to projectDir) where the loop-active marker is stored.
+ */
+const LOOP_ACTIVE_FILE = ".ralpi/loop-active.json";
+
+/**
+ * Write the loop-active marker, indicating an execution loop is running.
+ */
+export function writeLoopActive(
+	projectDir: string,
+	state: LoopActiveState,
+): void {
+	writeFileSafe(
+		path.join(projectDir, LOOP_ACTIVE_FILE),
+		JSON.stringify(state, null, 2),
+	);
+}
+
+/**
+ * Read the loop-active marker, if present.
+ */
+export function readLoopActive(projectDir: string): LoopActiveState | null {
+	const filePath = path.join(projectDir, LOOP_ACTIVE_FILE);
+	try {
+		const raw = fs.readFileSync(filePath, "utf-8");
+		return JSON.parse(raw) as LoopActiveState;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Delete the loop-active marker.
+ */
+export function deleteLoopActive(projectDir: string): void {
+	const filePath = path.join(projectDir, LOOP_ACTIVE_FILE);
+	try {
+		fs.unlinkSync(filePath);
+	} catch {
+		// Ignore if already gone
+	}
+}
+
+/**
+ * Discover the project directory by walking up to find `.ralpi/`.
+ */
+export function findRalpiDir(startDir: string): string | null {
+	let current = path.resolve(startDir);
+	const root = path.parse(current).root;
+	while (current !== root) {
+		if (fs.existsSync(path.join(current, ".ralpi"))) {
+			return current;
+		}
+		current = path.dirname(current);
+	}
+	return null;
+}
+
 // ─── Async Agent Session ────────────────────────────────────────────────────
 
 // ─── Progress Discovery ─────────────────────────────────────────────────────

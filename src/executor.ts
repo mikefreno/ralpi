@@ -13,6 +13,7 @@ import {
 	captureGitCommits,
 	formatDuration,
 } from "./utils";
+import { updateTaskInFile } from "./parser";
 
 /** Optional callback to post a progress message into the chat history. */
 export type SendChatMessage = (
@@ -33,7 +34,18 @@ export interface ToolCallEntry {
  *  messages rendered by registerMessageRenderer). */
 const MAX_COLLAPSED = 3;
 
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+export const SPINNER_FRAMES = [
+	"⠋",
+	"⠙",
+	"⠹",
+	"⠸",
+	"⠼",
+	"⠴",
+	"⠦",
+	"⠧",
+	"⠇",
+	"⠏",
+];
 
 // ─── Model Round-Robin ─────────────────────────────────────────────────────
 
@@ -135,6 +147,7 @@ export async function runTask(
 	projectDir: string = project.sourceDir,
 	parallelState?: ParallelWidgetState,
 	assignedModel?: unknown,
+	batchRender?: () => void,
 ): Promise<{
 	success: boolean;
 	reflection?: Reflection;
@@ -271,8 +284,10 @@ export async function runTask(
 					if (entry) {
 						entry.toolCalls.push({ name: event.toolName, label });
 					}
+					batchRender?.();
+				} else {
+					requestRender();
 				}
-				requestRender();
 			}
 		},
 		undefined, // no abort signal
@@ -291,6 +306,7 @@ export async function runTask(
 			entry.done = true;
 			entry.success = output.success;
 		}
+		batchRender?.();
 	} else {
 		ctx.ui.setWidget(widgetKey, undefined);
 	}
@@ -393,9 +409,12 @@ export async function executeBatch(
 		}
 	}
 
-	// Check if we should run parallel
+	// Check if we should run parallel.
+	// Use the parallel path whenever the user selected parallel mode,
+	// even for single-task batches produced by DAG dependency chains.
+	// Only sequential mode should inherit the parent session model.
 	const shouldParallel =
-		options?.parallel && tasks.length > 1 && config.execution.maxParallel > 0;
+		options?.parallel && tasks.length > 0 && config.execution.maxParallel > 0;
 
 	if (shouldParallel) {
 		await executeBatchParallel(
@@ -429,6 +448,12 @@ export async function executeBatch(
 
 			const errorMsg = error instanceof Error ? error.message : String(error);
 			progress.markFailed(task.id, errorMsg);
+			// Auto-update the PRD source file checkbox
+			try {
+				updateTaskInFile(project.sourcePath, task.id, "failed");
+			} catch {
+				// Best-effort
+			}
 			sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${errorMsg}`);
 			ctx.ui.notify(`Task ${task.id} failed: ${errorMsg}`, "error");
 			break;
@@ -518,14 +543,18 @@ async function executeBatchParallel(
 		};
 	});
 
-	// Single spinner timer drives all tasks in the batch
+	// Batch-render trigger: re-render on spinner ticks AND content changes.
+	// Spinner animation requires requestRender() on every tick; without it,
+	// spinner frames advance in memory but the display never updates.
+	const requestBatchRender = () => widgetTui?.requestRender();
+
 	const spinnerTimer = setInterval(() => {
 		for (const entry of sharedState.values()) {
 			if (!entry.done) {
 				entry.frameIndex = (entry.frameIndex + 1) % SPINNER_FRAMES.length;
 			}
 		}
-		widgetTui?.requestRender();
+		requestBatchRender();
 	}, 100);
 
 	const results: Array<{ task: Task; result: Promise<any> }> = [];
@@ -545,13 +574,21 @@ async function executeBatchParallel(
 				sharedState,
 				assignedModel,
 				roundRobin,
+				requestBatchRender,
 			).catch((error) => {
 				// Safety net: one task failure should never crash the batch.
 				// executeTask already marks failed and notifies, but catch as
 				// a last resort so the error doesn't propagate and crash pi.
 				roundRobin?.release(task.id);
+				requestBatchRender();
 				const errorMsg = error instanceof Error ? error.message : String(error);
 				progress.markFailed(task.id, errorMsg);
+				// Auto-update the PRD source file checkbox
+				try {
+					updateTaskInFile(project.sourcePath, task.id, "failed");
+				} catch {
+					// Best-effort
+				}
 				sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${errorMsg}`);
 				ctx.ui.notify(`Task ${task.id} failed: ${errorMsg}`, "error");
 			}),
@@ -586,6 +623,7 @@ async function executeTask(
 	parallelState?: ParallelWidgetState,
 	assignedModel?: unknown,
 	roundRobin?: ModelRoundRobin | null,
+	batchRender?: () => void,
 ): Promise<void> {
 	const maxRetries = config.execution.maxRetries;
 
@@ -609,6 +647,12 @@ async function executeTask(
 			try {
 				// Mark as in progress
 				progress.markInProgress(task.id);
+				// Auto-update the PRD source file checkbox
+				try {
+					updateTaskInFile(project.sourcePath, task.id, "in_progress");
+				} catch {
+					// Best-effort: don't fail the task over a checkbox update
+				}
 
 				// Get dependency reflections
 				const depReflections = progress.getDependencyReflections(
@@ -626,6 +670,7 @@ async function executeTask(
 					projectDir,
 					parallelState,
 					currentModel,
+					batchRender,
 				);
 
 				if (result.success) {
@@ -645,6 +690,12 @@ async function executeTask(
 						result.commitMessages,
 						result.commitSummary,
 					);
+					// Auto-update the PRD source file checkbox
+					try {
+						updateTaskInFile(project.sourcePath, task.id, "completed");
+					} catch {
+						// Best-effort: don't fail the task over a checkbox update
+					}
 					roundRobin?.release(task.id);
 					return;
 				}
@@ -675,6 +726,7 @@ async function executeTask(
 				} else {
 					// Max retries exceeded
 					progress.markFailed(task.id, result.error || "Unknown error");
+					// Don't update PRD — retry exhaustion is transient, not terminal
 					sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${result.error}`);
 					ctx.ui.notify(
 						`Task ${task.id} failed after ${maxRetries} retries: ${
@@ -686,8 +738,15 @@ async function executeTask(
 				}
 			} catch (error) {
 				roundRobin?.release(task.id);
+				batchRender?.();
 				const errorMsg = error instanceof Error ? error.message : String(error);
 				progress.markFailed(task.id, errorMsg);
+				// Auto-update the PRD source file checkbox
+				try {
+					updateTaskInFile(project.sourcePath, task.id, "failed");
+				} catch {
+					// Best-effort
+				}
 				sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${errorMsg}`);
 				ctx.ui.notify(`Task ${task.id} failed: ${errorMsg}`, "error");
 				return;
@@ -700,7 +759,9 @@ async function executeTask(
 
 	// All models exhausted — release the slot
 	roundRobin?.release(task.id);
+	batchRender?.();
 	progress.markFailed(task.id, "All configured models exhausted");
+	// Don't update PRD — model exhaustion is transient, not terminal
 	sendChatMessage?.(
 		`✗ ${task.id} · ${task.title} — all ${maxModelAttempts} models exhausted`,
 	);
