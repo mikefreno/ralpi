@@ -122,6 +122,10 @@ prompts:
 > tasks, only the first two models are used. The third model is only touched when
 > a third concurrent task starts. Freed model slots are reused before new ones
 > are allocated.
+>
+> **Automatic failover**: if a provider/API is unreachable (rate limit, 503, etc.),
+> the task automatically cycles to the next model in the list without counting it
+> as a task failure. Each model is tried once before the task is marked as failed.
 
 The keys mirror the nested structure of `RalpiConfig` in `src/types.ts`.
 

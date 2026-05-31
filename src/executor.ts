@@ -54,6 +54,10 @@ class ModelRoundRobin {
 		this.freeSlots = [];
 	}
 
+	get length(): number {
+		return this.models.length;
+	}
+
 	assign(taskId: string): unknown {
 		let index: number;
 		if (this.freeSlots.length > 0) {
@@ -385,8 +389,8 @@ export async function executeBatch(
 			projectDir,
 			undefined,
 			model,
+			roundRobin,
 		);
-		roundRobin?.release(task.id);
 	}
 }
 
@@ -483,7 +487,8 @@ async function executeBatchParallel(
 				projectDir,
 				sharedState,
 				assignedModel,
-			).finally(() => roundRobin?.release(task.id)),
+				roundRobin,
+			),
 		});
 
 		// Limit concurrency
@@ -514,75 +519,111 @@ async function executeTask(
 	projectDir: string = project.sourceDir,
 	parallelState?: ParallelWidgetState,
 	assignedModel?: unknown,
+	roundRobin?: ModelRoundRobin | null,
 ): Promise<void> {
 	const maxRetries = config.execution.maxRetries;
-	let retries = 0;
 
-	while (retries <= maxRetries) {
-		try {
-			// Mark as in progress
-			progress.markInProgress(task.id);
+	// Model failover: when a provider/API is down, cycle through available models.
+	// result.success === false always means an agent-session failure (API error,
+	// provider unreachable, etc.), not a task-work error.
+	const maxModelAttempts = roundRobin ? roundRobin.length : 1;
+	let modelAttempt = 0;
+	let currentModel: unknown = assignedModel ?? config.model;
 
-			// Get dependency reflections
-			const depReflections = progress.getDependencyReflections(
-				task.dependencies || [],
-			);
+	while (modelAttempt < maxModelAttempts) {
+		// Get the next model from round-robin (on first try, use the pre-assigned model)
+		if (modelAttempt > 0 && roundRobin) {
+			currentModel = roundRobin.assign(task.id);
+		}
 
-			// Run the task
-			const result = await runTask(
-				task,
-				project,
-				config,
-				depReflections,
-				ctx,
-				sendChatMessage,
-				projectDir,
-				parallelState,
-				assignedModel,
-			);
+		let retries = 0;
+		while (retries <= maxRetries) {
+			try {
+				// Mark as in progress
+				progress.markInProgress(task.id);
 
-			if (result.success) {
-				// Save reflection
-				if (result.reflection) {
-					saveReflectionToFile(projectDir, config, result.reflection);
+				// Get dependency reflections
+				const depReflections = progress.getDependencyReflections(
+					task.dependencies || [],
+				);
+
+				// Run the task
+				const result = await runTask(
+					task,
+					project,
+					config,
+					depReflections,
+					ctx,
+					sendChatMessage,
+					projectDir,
+					parallelState,
+					currentModel,
+				);
+
+				if (result.success) {
+					// Save reflection
+					if (result.reflection) {
+						saveReflectionToFile(projectDir, config, result.reflection);
+					}
+
+					// Mark completed with all metadata
+					progress.markCompleted(
+						task.id,
+						result.durationMs,
+						result.reflection,
+						result.toolUsage,
+						result.sessionFile,
+						result.outputPreview,
+						result.commitMessages,
+						result.commitSummary,
+					);
+					roundRobin?.release(task.id);
+					return;
 				}
 
-				// Mark completed with all metadata
-				progress.markCompleted(
-					task.id,
-					result.durationMs,
-					result.reflection,
-					result.toolUsage,
-					result.sessionFile,
-					result.outputPreview,
-					result.commitMessages,
-					result.commitSummary,
-				);
-				return;
-			}
+				// Agent session failed (provider error).
+				// If we have more models, cycle immediately — don't waste retries.
+				if (roundRobin && modelAttempt < maxModelAttempts - 1) {
+					roundRobin.release(task.id);
+					modelAttempt++;
+					ctx.ui.notify(
+						`Task ${task.id}: model failed, trying next (${modelAttempt + 1}/${maxModelAttempts}): ${result.error}`,
+						"warning",
+					);
+					break; // exit retry loop, cycle to next model
+				}
 
-			// Task failed, check if we should retry
-			if (retries < maxRetries) {
-				retries = progress.incrementRetry(task.id);
-				ctx.ui.notify(
-					`Retrying task ${task.id} (${retries}/${maxRetries}): ${result.error}`,
-					"warning",
-				);
+				// No more models — use normal retry logic
+				if (retries < maxRetries) {
+					retries = progress.incrementRetry(task.id);
+					ctx.ui.notify(
+						`Retrying task ${task.id} (${retries}/${maxRetries}): ${result.error}`,
+						"warning",
+					);
 
-				// Exponential backoff
-				const delay = config.execution.retryDelayMs * 2 ** (retries - 1);
-				await sleep(delay);
-			} else {
-				// Max retries exceeded
-				progress.markFailed(task.id, result.error || "Unknown error");
-				throw new Error(`Task ${task.id} failed: ${result.error}`);
+					// Exponential backoff
+					const delay = config.execution.retryDelayMs * 2 ** (retries - 1);
+					await sleep(delay);
+				} else {
+					// Max retries exceeded
+					progress.markFailed(task.id, result.error || "Unknown error");
+					throw new Error(`Task ${task.id} failed: ${result.error}`);
+				}
+			} catch (error) {
+				roundRobin?.release(task.id);
+				const errorMsg = error instanceof Error ? error.message : String(error);
+				progress.markFailed(task.id, errorMsg);
+				throw error;
 			}
-		} catch (error) {
-			const errorMsg = error instanceof Error ? error.message : String(error);
-			progress.markFailed(task.id, errorMsg);
-			throw error;
 		}
+
+		// If we broke out (model cycling), continue the outer loop
+		modelAttempt++;
 	}
+
+	// All models exhausted
+	progress.markFailed(task.id, "All configured models exhausted");
+	throw new Error(`Task ${task.id} failed: all configured models exhausted`);
 }
 
 // ─── Save Reflection to File ────────────────────────────────────────────────
