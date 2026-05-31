@@ -2,7 +2,7 @@
 
 ## What this is
 
-A Pi coding agent extension that registers the `/ralph` slash command. Not a standalone app — it runs inside Pi's extension host.
+A Pi coding agent extension that registers the `/ralpi` slash command. Not a standalone app — it runs inside Pi's extension host.
 
 ## Build
 
@@ -32,22 +32,22 @@ The only real npm dependency is `yaml` (^2.4.0).
   - `parser.ts` — task file parsing (Fio, checkbox, YAML formats)
   - `dag.ts` — Kahn's algorithm dependency resolution, batch planning
   - `executor.ts` — task execution, retry, parallel/sequential modes
-  - `progress.ts` — `.ralph/progress.json` state management
+  - `progress.ts` — `.ralpi/progress.json` state management
   - `prompts.ts` — prompt generation for spawned agent sessions
   - `reflection.ts` — reflection extraction from agent output
   - `utils.ts` — config loading, progress discovery, `runAgentSession()`
   - `types.ts` — all interfaces and `DEFAULT_CONFIG`
   - `widget-batcher.ts` — debounced widget updates for parallel tasks
-- `skills/ralph-task/SKILL.md` — Pi skill definition for task execution
-- `tasks/` — example ralph task files (self-modification history)
+- `skills/ralpi-use.md` — Pi skill definition for task execution
+- `tasks/` — example ralpi task files (self-modification history)
 
 ## Runtime state
 
-All runtime state lives in `.ralph/` (gitignored):
-- `.ralph/progress.json` — execution progress, supports multiple PRDs
-- `.ralph/reflections/` — per-task reflection JSON files
-- `.ralph/prompts/` — generated prompts (timestamped, for debugging)
-- `.ralph/sessions/` — full session transcripts
+All runtime state lives in `.ralpi/` (gitignored):
+- `.ralpi/progress.json` — execution progress, supports multiple PRDs
+- `.ralpi/reflections/` — per-task reflection JSON files
+- `.ralpi/prompts/` — generated prompts (timestamped, for debugging)
+- `.ralpi/sessions/` — full session transcripts
 
 ## Task ID convention
 
@@ -55,8 +55,8 @@ Task IDs are zero-padded strings (`"01"`, `"02"`, etc.). The parser prepends `0`
 
 ## Command routing
 
-`/ralph` with no args → plan. First token looks like a path (`@path`, `./path`, `.md`, etc.) → run. Otherwise dispatches to subcommand (`run`, `plan`, `status`, `resume`, `next`, `reset`).
+`/ralpi` with no args → plan. First token looks like a path (`@path`, `./path`, `.md`, etc.) → run. Otherwise dispatches to subcommand (`run`, `plan`, `status`, `resume`, `next`, `reset`).
 
 ## Config
 
-Read from `.ralph/config.yaml` in project directory. Falls back to `DEFAULT_CONFIG` in `src/types.ts` when file is missing. Config is loaded at `projectDir` level, not extension level.
+Read from `.ralpi/config.yaml` in project directory. Falls back to `DEFAULT_CONFIG` in `src/types.ts` when file is missing. Config is loaded at `projectDir` level, not extension level.

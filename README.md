@@ -6,7 +6,7 @@ Execute tasks from task files using DAG-based dependency resolution with persist
 
 - **DAG-based execution**: Tasks are ordered by dependencies using Kahn's algorithm
 - **Parallel batching**: Independent tasks in each batch can run concurrently
-- **Persistent progress**: Execution state saved to `.ralph/progress.json`
+- **Persistent progress**: Execution state saved to `.ralpi/progress.json`
 - **Reflection system**: Each task produces a reflection for downstream tasks
 - **Retry with backoff**: Failed tasks retry with exponential backoff
 - **Multiple formats**: Supports Fio README, simple checkboxes, and YAML
@@ -21,12 +21,12 @@ Execute tasks from task files using DAG-based dependency resolution with persist
 ## Usage
 
 ```
-/ralph plan [task-file]   # Show execution plan
-/ralph run [task-file]    # Execute all tasks
-/ralph status [task-file] # Show current progress
-/ralph resume [task-file] # Resume paused execution
-/ralph next [task-file]   # Execute next batch only
-/ralph reset [task-file]  # Reset all progress
+/ralpi plan [task-file]   # Show execution plan
+/ralpi run [task-file]    # Execute all tasks
+/ralpi status [task-file] # Show current progress
+/ralpi resume [task-file] # Resume paused execution
+/ralpi next [task-file]   # Execute next batch only
+/ralpi reset [task-file]  # Reset all progress
 ```
 
 ## Task File Formats
@@ -98,7 +98,7 @@ tasks:
 
 ## Configuration
 
-Create `.ralph/config.yaml`:
+Create `.ralpi/config.yaml`:
 
 ```yaml
 maxRetries: 3
@@ -121,7 +121,7 @@ Supported formats: `10m` (minutes), `600s` (seconds), `3600000` (milliseconds)
 
 ## State Files
 
-- `.ralph/progress.json` - Execution progress
-- `.ralph/reflections/` - Per-task reflections
-- `.ralph/prompts/` - Generated prompts
-- `.ralph/sessions/` - Full task output for review
+- `.ralpi/progress.json` - Execution progress
+- `.ralpi/reflections/` - Per-task reflections
+- `.ralpi/prompts/` - Generated prompts
+- `.ralpi/sessions/` - Full task output for review

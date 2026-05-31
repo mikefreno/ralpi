@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
-	RalphConfig,
+	RalpiConfig,
 	PRDProgress,
 	ProgressState,
 	ToolUsage,
@@ -39,7 +39,7 @@ export function writeFileSafe(filePath: string, content: string): void {
 // ─── Progress Discovery ─────────────────────────────────────────────────────
 
 /**
- * Find the nearest .ralph/progress.json by walking up from the given directory.
+ * Find the nearest .ralpi/progress.json by walking up from the given directory.
  * For a specific sourcePath, finds the matching PRD entry.
  */
 export function findProgressFile(
@@ -50,7 +50,7 @@ export function findProgressFile(
 	const root = path.parse(current).root;
 
 	while (current !== root) {
-		const candidate = path.join(current, ".ralph", "progress.json");
+		const candidate = path.join(current, ".ralpi", "progress.json");
 		if (fs.existsSync(candidate)) {
 			try {
 				const raw = fs.readFileSync(candidate, "utf-8");
@@ -113,9 +113,9 @@ function parseSimpleYaml(content: string): Record<string, any> {
  * Deep merge configuration objects
  */
 function mergeConfig(
-	defaults: RalphConfig,
+	defaults: RalpiConfig,
 	overrides: Record<string, any>,
-): RalphConfig {
+): RalpiConfig {
 	const result = { ...defaults };
 
 	for (const [key, value] of Object.entries(overrides)) {
@@ -126,14 +126,14 @@ function mergeConfig(
 		}
 	}
 
-	return result as RalphConfig;
+	return result as RalpiConfig;
 }
 
 /**
- * Load configuration from .ralph/config.yaml or return defaults
+ * Load configuration from .ralpi/config.yaml or return defaults
  */
-export function loadConfig(projectDir: string): RalphConfig {
-	const configPath = path.join(projectDir, ".ralph", "config.yaml");
+export function loadConfig(projectDir: string): RalpiConfig {
+	const configPath = path.join(projectDir, ".ralpi", "config.yaml");
 
 	// Return defaults silently when config file does not exist
 	if (!fs.existsSync(configPath)) {

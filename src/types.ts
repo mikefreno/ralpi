@@ -137,9 +137,9 @@ export interface PRDProgress {
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
-export interface RalphConfig {
+export interface RalpiConfig {
 	paths: {
-		/** Directory for ralph state files */
+		/** Directory for ralpi state files */
 		stateDir: string;
 		/** Directory for per-task reflections */
 		reflectionsDir: string;
@@ -162,10 +162,10 @@ export interface RalphConfig {
 	};
 }
 
-export const DEFAULT_CONFIG: RalphConfig = {
+export const DEFAULT_CONFIG: RalpiConfig = {
 	paths: {
-		stateDir: ".ralph",
-		reflectionsDir: ".ralph/reflections",
+		stateDir: ".ralpi",
+		reflectionsDir: ".ralpi/reflections",
 	},
 	execution: {
 		maxRetries: 3,

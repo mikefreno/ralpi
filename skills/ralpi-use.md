@@ -1,6 +1,10 @@
-# ralph-task
+---
+description: Executes individual tasks from ralpi task files using DAG-based dependency resolution, with progress tracking and reflection support
+---
 
-Execute a single task from a ralph task file.
+# ralpi-task
+
+Execute a single task from a ralpi task file.
 
 ## When to Use
 
@@ -11,9 +15,9 @@ Execute a single task from a ralph task file.
 ## Usage
 
 ```
-/ralph run [task-file]      # Run all tasks
-/ralph next [task-file]     # Run next batch
-/ralph status [task-file]   # Check progress
+/ralpi run [task-file]      # Run all tasks
+/ralpi next [task-file]     # Run next batch
+/ralpi status [task-file]   # Check progress
 ```
 
 ## Task File Location

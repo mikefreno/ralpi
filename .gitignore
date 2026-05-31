@@ -1,3 +1,4 @@
 node_modules
 dist
 .pi-lens
+package-lock.json
