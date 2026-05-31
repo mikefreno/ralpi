@@ -71,27 +71,37 @@ export async function runTask(
 
 	const taskHeader = `${task.id} · ${task.title}`;
 
-	// Live progress widget above the editor — animated spinner + tool call updates
+	// Live progress widget above the editor — animated spinner + tool call tree
 	// Using setWidget instead of setWorkingMessage because the working message area
 	// is only visible during parent agent streaming, not during extension command execution.
 	const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 	let frameIndex = 0;
-	let lastToolLabel = "";
 	const theme = ctx.ui.theme;
+	const MAX_COLLAPSED = 3;
 
 	const toolCalls: ToolCallEntry[] = [];
 
 	const updateWidget = () => {
 		const frame = theme.fg("accent", SPINNER_FRAMES[frameIndex]);
 		const lines = [`${frame} ${taskHeader}`];
+
 		if (toolCalls.length > 0) {
-			lines.push(
-				theme.fg(
-					"dim",
-					`  ${toolCalls.length} tool${toolCalls.length !== 1 ? "s" : ""} · ${lastToolLabel}`,
-				),
-			);
+			const shown = toolCalls.slice(-MAX_COLLAPSED);
+			const remaining = toolCalls.length - shown.length;
+
+			if (remaining > 0) {
+				lines.push(theme.fg("dim", `  ├── ${remaining} more`));
+			}
+
+			for (let i = 0; i < shown.length; i++) {
+				const entry = shown[i];
+				const isLast = i === shown.length - 1;
+				const branch = isLast ? "  └── " : "  ├── ";
+				const tag = theme.fg("accent", `[${entry.name}]`);
+				lines.push(`${branch}${tag} ${entry.label}`);
+			}
 		}
+
 		ctx.ui.setWidget("ralph-task", lines);
 	};
 
@@ -119,8 +129,6 @@ export async function runTask(
 					name: event.toolName,
 					label,
 				});
-				// Update widget with latest tool call info
-				lastToolLabel = `[${event.toolName}] ${label}`;
 				updateWidget();
 			}
 		},

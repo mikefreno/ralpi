@@ -88,13 +88,38 @@ function parseFioFormat(
 		}
 
 		if (inDeps) {
-			const depMatch = line.match(/^(\d+)\s*->\s*(\d+)/);
-			if (depMatch) {
-				const [, from, to] = depMatch;
+			// Format 2: Arrow notation with multiple targets
+			// "01 -> 02,03,06 (description)" means 02, 03, 06 depend on 01
+			const arrowMatch = line.match(/^(\d+)\s*->\s*([\d,\s]+?)(?:\s*\(|$)/);
+			if (arrowMatch) {
+				const [, from, targets] = arrowMatch;
 				const fromId = `0${from}`;
-				const toId = `0${to}`;
-				if (!dependencies[fromId]) dependencies[fromId] = [];
-				dependencies[fromId].push(toId);
+				const targetIds = targets
+					.split(",")
+					.map((t) => t.trim())
+					.filter((t) => t)
+					.map((t) => `0${t}`);
+				
+				// Each target depends on the source
+				for (const toId of targetIds) {
+					if (!dependencies[toId]) dependencies[toId] = [];
+					dependencies[toId].push(fromId);
+				}
+			}
+
+			// Format 1: Natural language "X depends on A, B, C"
+			const dependsMatch = line.match(/^(\d+)\s+depends\s+on\s+([\d,\s]+)/i);
+			if (dependsMatch) {
+				const [, taskId, depsList] = dependsMatch;
+				const taskIdPadded = `0${taskId}`;
+				const depIds = depsList
+					.split(",")
+					.map((t) => t.trim())
+					.filter((t) => t)
+					.map((t) => `0${t}`);
+				
+				if (!dependencies[taskIdPadded]) dependencies[taskIdPadded] = [];
+				dependencies[taskIdPadded].push(...depIds);
 			}
 
 			// Parse meta blocks for task configuration (timeout, etc.)
@@ -125,6 +150,13 @@ function parseFioFormat(
 	// Extract objective from top-level heading
 	const objectiveMatch = content.match(/^#\s+(.+)$/m);
 	const objective = objectiveMatch ? objectiveMatch[1].trim() : undefined;
+
+	// Apply dependencies map to task.dependencies arrays
+	for (const task of tasks) {
+		if (dependencies[task.id]) {
+			task.dependencies = dependencies[task.id];
+		}
+	}
 
 	return {
 		tasks,

@@ -44,9 +44,34 @@ Execute tasks from task files using DAG-based dependency resolution with persist
 
 ## Dependencies
 
-1 -> 2
+1 -> 2,3
 2 -> 3
 ```
+
+#### Supported Dependency Formats
+
+The parser supports two dependency declaration styles in the `## Dependencies` section:
+
+**Arrow Notation** (recommended):
+```
+1 -> 2,3,4
+5 -> 6
+```
+This means: "Task 1 must complete before tasks 2, 3, and 4 can start."
+
+**Natural Language**:
+```
+13 depends on 17, 18, 19, 20
+14 depends on 13, 15, 16
+```
+This means: "Task 13 depends on tasks 17, 18, 19, and 20."
+
+**Parallel Groups** (informational only):
+```
+1, 2, 3, 4 can be done in parallel
+5, 6, 7, 8 can be done in parallel
+```
+Note: These lines are ignored by the parser. Use explicit dependencies to control execution order.
 
 ### Simple Checkbox Format
 
