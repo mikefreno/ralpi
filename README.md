@@ -2,6 +2,10 @@
 
 Execute tasks from task files until done using DAG-based dependency resolution with persistent progress tracking.
 
+```bash
+pi install npm:@mikefreno/ralpi
+```
+
 ## Features
 
 - **Parallel batching**: Independent tasks in each batch can run concurrently
@@ -17,17 +21,13 @@ Execute tasks from task files until done using DAG-based dependency resolution w
 ## Usage
 
 ```
-/ralpi [task-file]        # Execute all tasks
-/ralpi plan               # Alias to /task-manager to plan new tasks
-/ralpi resume             # Resume paused execution
-/ralpi reset [task-file]  # Reset progress and .ralpi directory - does not modify PRD
+/ralpi [task-file]  # Execute all tasks
+/ralpi plan         # Alias to /task-manager to plan new tasks
+/ralpi resume       # Resume paused execution
+/ralpi reset        # Reset progress and .ralpi directory - does not modify PRD
 ```
 
-## Task File Formats
-
-### Highly recommended to use the task-manager prompt for prd construction, it's output pairs perfectly
-
-# Project Title
+### Highly recommended to use the task-manager prompt for prd construction, it's output pairs perfectly - /task-manager or /ralpi plan
 
 ## Tasks
 
