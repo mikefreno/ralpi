@@ -54,7 +54,7 @@ Task IDs are zero-padded strings (`"01"`, `"02"`, etc.). The parser prepends `0`
 
 ## Command routing
 
-`/ralpi` with no args → plan. First token looks like a path (`@path`, `./path`, `.md`, etc.) → run. Otherwise dispatches to subcommand (`run`, `plan`, `status`, `resume`, `next`, `reset`).
+`/ralpi` with no args → plan. First token looks like a path (`@path`, `./path`, `.md`, etc.) → run. Otherwise dispatches to subcommand (`run`, `plan`, `resume`, `reset`).
 
 ## Config
 

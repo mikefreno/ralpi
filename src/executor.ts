@@ -296,8 +296,8 @@ export async function runTask(
 	}
 
 	if (!output.success) {
-		sendChatMessage?.(`✗ ${taskHeader} — ${output.error}`);
-		ctx.ui.notify(`Task ${task.id} failed: ${output.error}`, "error");
+		// Failure reporting is handled by the caller (executeTask) to avoid
+		// duplicate messages when model failover or retry cycling is active.
 		return {
 			success: false,
 			error: output.error,
@@ -433,6 +433,7 @@ export async function executeBatch(
 			roundRobin?.release(task.id);
 			const errorMsg = error instanceof Error ? error.message : String(error);
 			progress.markFailed(task.id, errorMsg);
+			sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${errorMsg}`);
 			ctx.ui.notify(`Task ${task.id} failed: ${errorMsg}`, "error");
 			break;
 		}
@@ -555,6 +556,7 @@ async function executeBatchParallel(
 				roundRobin?.release(task.id);
 				const errorMsg = error instanceof Error ? error.message : String(error);
 				progress.markFailed(task.id, errorMsg);
+				sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${errorMsg}`);
 				ctx.ui.notify(`Task ${task.id} failed: ${errorMsg}`, "error");
 			}),
 		});
@@ -658,9 +660,8 @@ async function executeTask(
 					// release() would put the slot in freeSlots, then assign()
 					// would pick it right back up, getting stuck on the same model.
 					modelAttempt++;
-					ctx.ui.notify(
-						`Task ${task.id}: model failed, trying next (${modelAttempt + 1}/${maxModelAttempts}): ${result.error}`,
-						"warning",
+					sendChatMessage?.(
+						`~ ${task.id} · ${task.title} — trying model ${modelAttempt + 1}/${maxModelAttempts} (previous: ${result.error})`,
 					);
 					break; // exit retry loop, cycle to next model
 				}
@@ -668,9 +669,8 @@ async function executeTask(
 				// No more models — use normal retry logic
 				if (retries < maxRetries) {
 					retries = progress.incrementRetry(task.id);
-					ctx.ui.notify(
-						`Retrying task ${task.id} (${retries}/${maxRetries}): ${result.error}`,
-						"warning",
+					sendChatMessage?.(
+						`~ ${task.id} · ${task.title} — retrying (${retries}/${maxRetries}): ${result.error}`,
 					);
 
 					// Exponential backoff
@@ -679,6 +679,7 @@ async function executeTask(
 				} else {
 					// Max retries exceeded
 					progress.markFailed(task.id, result.error || "Unknown error");
+					sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${result.error}`);
 					ctx.ui.notify(
 						`Task ${task.id} failed after ${maxRetries} retries: ${
 							result.error || "Unknown error"
@@ -691,6 +692,7 @@ async function executeTask(
 				roundRobin?.release(task.id);
 				const errorMsg = error instanceof Error ? error.message : String(error);
 				progress.markFailed(task.id, errorMsg);
+				sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${errorMsg}`);
 				ctx.ui.notify(`Task ${task.id} failed: ${errorMsg}`, "error");
 				return;
 			}
@@ -703,6 +705,9 @@ async function executeTask(
 	// All models exhausted — release the slot
 	roundRobin?.release(task.id);
 	progress.markFailed(task.id, "All configured models exhausted");
+	sendChatMessage?.(
+		`✗ ${task.id} · ${task.title} — all ${maxModelAttempts} models exhausted`,
+	);
 	ctx.ui.notify(
 		`Task ${task.id} failed: all configured models exhausted`,
 		"error",
