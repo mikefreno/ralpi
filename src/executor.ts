@@ -14,9 +14,13 @@ import {
 } from "./utils";
 
 /** Optional callback to post a progress message into the chat history. */
-export type SendChatMessage = (content: string) => void;
+export type SendChatMessage = (
+	content: string,
+	/** Extra data passed to the message renderer for the expanded view. */
+	meta?: { toolCalls?: ToolCallEntry[] },
+) => void;
 
-interface ToolCallEntry {
+export interface ToolCallEntry {
 	name: string;
 	label: string;
 }
@@ -34,6 +38,7 @@ export async function runTask(
 	depReflections: Reflection[],
 	ctx: ExtensionCommandContext,
 	sendChatMessage?: SendChatMessage,
+	projectDir: string = project.sourceDir,
 ): Promise<{
 	success: boolean;
 	reflection?: Reflection;
@@ -56,7 +61,7 @@ export async function runTask(
 	);
 
 	// Write prompt to .ralph/ with timestamp (for debugging)
-	const ralphDir = path.join(project.sourceDir, ".ralph");
+	const ralphDir = path.join(projectDir, ".ralph");
 	ensureDir(ralphDir);
 	const promptFile = path.join(ralphDir, `prompt-${startMs}.md`);
 	writeFileSafe(promptFile, prompt);
@@ -64,42 +69,68 @@ export async function runTask(
 	// Footer shows just the task title (no batch prefix)
 	ctx.ui.setStatus("ralph", task.title);
 
-	// Animated spinner in Pi's streaming area — shows as actual spinner, not static text
 	const taskHeader = `${task.id} · ${task.title}`;
-	ctx.ui.setWorkingMessage(taskHeader);
+
+	// Live progress widget above the editor — animated spinner + tool call updates
+	// Using setWidget instead of setWorkingMessage because the working message area
+	// is only visible during parent agent streaming, not during extension command execution.
+	const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+	let frameIndex = 0;
+	let lastToolLabel = "";
+	const theme = ctx.ui.theme;
+
+	const toolCalls: ToolCallEntry[] = [];
+
+	const updateWidget = () => {
+		const frame = theme.fg("accent", SPINNER_FRAMES[frameIndex]);
+		const lines = [`${frame} ${taskHeader}`];
+		if (toolCalls.length > 0) {
+			lines.push(
+				theme.fg(
+					"dim",
+					`  ${toolCalls.length} tool${toolCalls.length !== 1 ? "s" : ""} · ${lastToolLabel}`,
+				),
+			);
+		}
+		ctx.ui.setWidget("ralph-task", lines);
+	};
+
+	// Smooth spinner animation at 100ms intervals
+	const spinnerTimer = setInterval(() => {
+		frameIndex = (frameIndex + 1) % SPINNER_FRAMES.length;
+		updateWidget();
+	}, 100);
+
+	// Initial display
+	updateWidget();
 
 	// Use task-level timeout if set, otherwise fall back to config
 	const timeoutMs = task.timeoutMs ?? config.execution.timeoutMs;
 
-	// Collect tool call entries during execution
-	const toolCalls: ToolCallEntry[] = [];
-	let lastUpdateCount = 0;
-	const UPDATE_THROTTLE = 5;
-
 	// Run task asynchronously via Pi SDK — event loop stays responsive
 	const output = await runAgentSession(
 		prompt,
-		project.sourceDir,
+		projectDir,
 		timeoutMs,
 		(event) => {
 			if (event.type === "tool_execution_start") {
+				const label = formatToolArg(event.toolName, event.args);
 				toolCalls.push({
 					name: event.toolName,
-					label: formatToolArg(event.toolName, event.args),
+					label,
 				});
-				// Send periodic chat update every N tool calls
-				if (toolCalls.length - lastUpdateCount >= UPDATE_THROTTLE) {
-					lastUpdateCount = toolCalls.length;
-					sendChatMessage?.(buildRunningMessage(taskHeader, toolCalls));
-				}
+				// Update widget with latest tool call info
+				lastToolLabel = `[${event.toolName}] ${label}`;
+				updateWidget();
 			}
 		},
 	);
 
 	const durationMs = Date.now() - startMs;
 
-	// Clear working message after task finishes
-	ctx.ui.setWorkingMessage();
+	// Clear progress widget and status after task finishes
+	clearInterval(spinnerTimer);
+	ctx.ui.setWidget("ralph-task", undefined);
 	ctx.ui.setStatus("ralph", undefined);
 
 	if (!output.success) {
@@ -116,13 +147,11 @@ export async function runTask(
 	const toolUsage = output.toolUsage;
 
 	// Capture git commits made during this task
-	const { commitMessages, commitSummary } = captureGitCommits(
-		project.sourceDir,
-	);
+	const { commitMessages, commitSummary } = captureGitCommits(projectDir);
 
 	// Save full session transcript to .ralph/sessions/
 	const sessionFile = saveSessionOutput(
-		project.sourceDir,
+		projectDir,
 		task.id,
 		JSON.stringify(output.events, null, 2),
 	);
@@ -136,10 +165,9 @@ export async function runTask(
 	// Extract reflection from agent output
 	const reflection = extractReflection(agentText, task.id, task.title);
 
-	// Post completion chat message with tree format
+	// Post completion chat message — header only, renderer builds the expandable tree
 	const dur = formatDuration(durationMs);
-	const tree = formatToolCallTree(taskHeader, toolCalls, dur);
-	sendChatMessage?.(tree);
+	sendChatMessage?.(`✓ ${taskHeader} (${dur})`, { toolCalls });
 
 	return {
 		success: true,
@@ -182,6 +210,7 @@ export async function executeBatch(
 	ctx: ExtensionCommandContext,
 	options?: { parallel?: boolean },
 	sendChatMessage?: SendChatMessage,
+	projectDir?: string,
 ): Promise<void> {
 	// Check if we should run parallel
 	const shouldParallel =
@@ -195,13 +224,22 @@ export async function executeBatch(
 			progress,
 			ctx,
 			sendChatMessage,
+			projectDir,
 		);
 		return;
 	}
 
 	// Execute sequentially
 	for (const task of tasks) {
-		await executeTask(task, project, config, progress, ctx, sendChatMessage);
+		await executeTask(
+			task,
+			project,
+			config,
+			progress,
+			ctx,
+			sendChatMessage,
+			projectDir,
+		);
 	}
 }
 
@@ -215,6 +253,7 @@ async function executeBatchParallel(
 	progress: ProgressTracker,
 	ctx: ExtensionCommandContext,
 	sendChatMessage?: SendChatMessage,
+	projectDir?: string,
 ): Promise<void> {
 	const maxParallel = config.execution.maxParallel;
 	const results: Array<{ task: Task; result: Promise<any> }> = [];
@@ -229,6 +268,7 @@ async function executeBatchParallel(
 				progress,
 				ctx,
 				sendChatMessage,
+				projectDir,
 			),
 		});
 
@@ -254,6 +294,7 @@ async function executeTask(
 	progress: ProgressTracker,
 	ctx: ExtensionCommandContext,
 	sendChatMessage?: SendChatMessage,
+	projectDir: string = project.sourceDir,
 ): Promise<void> {
 	const maxRetries = config.execution.maxRetries;
 	let retries = 0;
@@ -276,12 +317,13 @@ async function executeTask(
 				depReflections,
 				ctx,
 				sendChatMessage,
+				projectDir,
 			);
 
 			if (result.success) {
 				// Save reflection
 				if (result.reflection) {
-					saveReflectionToFile(project.sourceDir, config, result.reflection);
+					saveReflectionToFile(projectDir, config, result.reflection);
 				}
 
 				// Mark completed with all metadata
@@ -343,8 +385,6 @@ function sleep(ms: number): Promise<void> {
 
 // ─── Tool Call Formatting ────────────────────────────────────────────────
 
-const MAX_DETAIL_TOOL_CALLS = 3;
-
 /**
  * Format a tool call argument into a short label.
  */
@@ -376,77 +416,4 @@ function truncateMiddle(s: string, maxLen: number): string {
 	if (s.length <= maxLen) return s;
 	const half = Math.floor((maxLen - 3) / 2);
 	return s.slice(0, half) + "…" + s.slice(s.length - half);
-}
-
-/**
- * Build a brief running-status chat message (displayed during task execution).
- *
- * ```
- * ⠿ 05 · billing-subscriptions-trials
- *   ├── 12 tools
- *   └── [bash] find /path -name "*.tsx"
- * ```
- */
-function buildRunningMessage(
-	header: string,
-	toolCalls: ToolCallEntry[],
-): string {
-	const lines: string[] = [`⠿ ${header}`];
-	const last = toolCalls[toolCalls.length - 1];
-	if (last) {
-		lines.push(`  ├── ${toolCalls.length} tools`);
-		lines.push(`  └── [${last.name}] ${last.label}`);
-	}
-	return lines.join("\n");
-}
-
-/**
- * Build a tree-format chat message showing tool calls.
- *
- * ```
- * ✓ 05 · billing-subscriptions-trials (2m 14s)
- *   ├── 24 reads, 14 bash, 6 writes, 5 edits
- *   ├── [bash] find /path -name "*.tsx"
- *   ├── [write] /path/routes/pricing.tsx
- *   └── [bash] npm test ...
- * ```
- *
- * Older calls are summarized as a tool-type breakdown above detailed entries.
- * Newest calls appear at the bottom.
- */
-function formatToolCallTree(
-	header: string,
-	toolCalls: ToolCallEntry[],
-	duration: string,
-): string {
-	const lines: string[] = [`✓ ${header} (${duration})`];
-
-	if (toolCalls.length === 0) {
-		return lines.join("\n");
-	}
-
-	// Show tool-type breakdown instead of "N more"
-	const typeCounts = new Map<string, number>();
-	for (const t of toolCalls) {
-		typeCounts.set(t.name, (typeCounts.get(t.name) ?? 0) + 1);
-	}
-	const summary = [...typeCounts.entries()]
-		.map(([name, count]) => `${count} ${name}`)
-		.join(", ");
-
-	// Determine which entries to show in detail (last N)
-	const shown = toolCalls.slice(-MAX_DETAIL_TOOL_CALLS);
-
-	// Tool-type summary line BEFORE detailed entries
-	lines.push(`  ├── ${summary}`);
-
-	// Detailed entries (newest at bottom)
-	for (let i = 0; i < shown.length; i++) {
-		const entry = shown[i];
-		const isLast = i === shown.length - 1;
-		const prefix = isLast ? "  └──" : "  ├──";
-		lines.push(`${prefix} [${entry.name}] ${entry.label}`);
-	}
-
-	return lines.join("\n");
 }

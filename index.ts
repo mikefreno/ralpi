@@ -45,74 +45,58 @@ function looksLikePath(token: string): boolean {
 // ─── Extension Entry ────────────────────────────────────────────────────────
 
 export default function ralphLoopExtension(pi: ExtensionAPI): void {
-	// Register custom message renderer for ralph progress messages
+	// Register custom message renderer for ralph progress messages.
+	// Renders an expandable tool-call tree: collapsed shows last 3 + "N more",
+	// expanded (Ctrl+O) shows every tool call.
 	pi.registerMessageRenderer(
 		"ralph-progress",
 		(message, { expanded }, theme) => {
 			const details = message.details as
 				| {
-						taskId?: string;
-						taskTitle?: string;
 						phase?: string;
-						timestamp?: number;
-						durationMs?: number;
-						toolUsage?: Record<string, number>;
-						commits?: number;
-						error?: string;
+						toolCalls?: Array<{ name: string; label: string }>;
 				  }
 				| undefined;
 
-			const phase = details?.phase ?? "info";
-			const phaseLabel =
-				phase === "starting"
-					? theme.fg("accent", "[RUNNING]")
-					: phase === "completed"
-						? theme.fg("success", "[DONE]")
-						: phase === "failed"
-							? theme.fg("error", "[FAIL]")
-							: phase === "batch_start"
-								? theme.fg("accent", "[BATCH]")
-								: phase === "retry"
-									? theme.fg("warning", "[RETRY]")
-									: phase === "progress"
-										? ""
-										: theme.fg("dim", "[INFO]");
+			const MAX_COLLAPSED = 3;
+			const lines: string[] = [];
 
-			let text = phaseLabel
-				? `${phaseLabel} ${message.content}`
-				: String(message.content);
+			// Header line — e.g. "✓ 05 · billing-subscriptions-trials (2m 14s)"
+			lines.push(String(message.content));
 
-			// Show expanded details
-			if (expanded && details) {
-				const lines: string[] = [];
-				if (details.taskId) lines.push(`  Task: ${details.taskId}`);
-				if (details.durationMs) {
-					const dur = formatDuration(details.durationMs);
-					lines.push(`  Duration: ${dur}`);
-				}
-				if (details.toolUsage) {
-					const tools = Object.entries(details.toolUsage)
-						.filter(([, v]) => v > 0)
-						.map(([k, v]) => `[${k}]: ${v}`)
-						.join(" ");
-					if (tools) lines.push(`  Tools: ${tools}`);
-				}
-				if (details.commits && details.commits > 0) {
-					lines.push(`  Commits: ${details.commits}`);
-				}
-				if (details.error) {
-					lines.push(`  Error: ${details.error}`);
-				}
-				if (details.timestamp) {
-					const time = new Date(details.timestamp).toLocaleTimeString();
-					lines.push(`  Time: ${time}`);
-				}
-				if (lines.length > 0) {
-					text += "\n" + lines.join("\n");
+			// Build tool-call tree
+			if (details?.toolCalls && details.toolCalls.length > 0) {
+				const all = details.toolCalls;
+
+				if (expanded) {
+					// Expanded: show ALL tool calls
+					for (let i = 0; i < all.length; i++) {
+						const entry = all[i];
+						const isLast = i === all.length - 1;
+						const branch = isLast ? "  └── " : "  ├── ";
+						const tag = theme.fg("accent", `[${entry.name}]`);
+						lines.push(`${branch}${tag} ${entry.label}`);
+					}
+				} else {
+					// Collapsed: last N + "X more"
+					const shown = all.slice(-MAX_COLLAPSED);
+					const remaining = all.length - shown.length;
+
+					if (remaining > 0) {
+						lines.push(theme.fg("dim", `  ├── ${remaining} more`));
+					}
+
+					for (let i = 0; i < shown.length; i++) {
+						const entry = shown[i];
+						const isLast = i === shown.length - 1;
+						const branch = isLast ? "  └── " : "  ├── ";
+						const tag = theme.fg("accent", `[${entry.name}]`);
+						lines.push(`${branch}${tag} ${entry.label}`);
+					}
 				}
 			}
 
-			// Use Box with customMessageBg for consistent styling
+			const text = lines.join("\n");
 			const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
 			box.addChild(new Text(text, 0, 0));
 			return box;
@@ -128,12 +112,16 @@ export default function ralphLoopExtension(pi: ExtensionAPI): void {
 			// Wraps pi.sendMessage() for posting status to the chat history.
 			// Uses "ralph-progress" customType with a "progress" phase so the
 			// renderer omits the label prefix entirely (no [INFO] etc.).
-			const sendProgress = (content: string) => {
+			// Accepts an optional meta object with toolCalls for the expandable view.
+			const sendProgress = (
+				content: string,
+				meta?: { toolCalls?: Array<{ name: string; label: string }> },
+			) => {
 				pi.sendMessage({
 					customType: "ralph-progress",
 					content,
 					display: true,
-					details: { phase: "progress" },
+					details: { phase: "progress", toolCalls: meta?.toolCalls },
 				});
 			};
 
@@ -274,6 +262,7 @@ async function handleRun(
 			ctx as any,
 			{ parallel: useParallel },
 			sendChatMessage,
+			projectDir,
 		);
 
 		for (const task of batch.tasks) {
@@ -406,6 +395,7 @@ async function handleResume(
 			ctx as any,
 			{ parallel: useParallel },
 			sendChatMessage,
+			projectDir,
 		);
 
 		for (const task of batch.tasks) {
@@ -481,6 +471,7 @@ async function handleNext(
 			ctx as any,
 			undefined,
 			sendChatMessage,
+			projectDir,
 		);
 		updateTaskInFile(taskFile, task.id, progress.getTaskStatus(task.id));
 	}
