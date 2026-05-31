@@ -98,15 +98,33 @@ tasks:
 
 ## Configuration
 
-Create `.ralpi/config.yaml`:
+Create config files. Both are optional:
+
+| Scope | Path |
+|-------|------|
+| **Global** | `~/.pi/ralpi/config.yaml` |
+| **Project** | `./.ralpi/config.yaml` |
 
 ```yaml
-maxRetries: 3
-retryDelayMs: 5000
-timeoutMs: 1800000
-maxParallel: 3
-projectContext: "Additional context for all tasks"
+execution:
+  maxParallel: 3          # ralpi-level concurrency only
+prompts:
+  projectContext: "Additional context for all tasks"
 ```
+
+> ralpi deliberately does **not** set timeouts or retries — those are inherited
+> from Pi's own settings. Tasks run until they complete or Pi's own flow stops them.
+
+The keys mirror the nested structure of `RalpiConfig` in `src/types.ts`.
+
+### Precedence (highest wins)
+
+| Priority | Source |
+|----------|--------|
+| **1st** | In-memory overrides (`model`, `thinkingLevel` from parent Pi session) |
+| **2nd** | `./.ralpi/config.yaml` — project-level |
+| **3rd** | `~/.pi/ralpi/config.yaml` — global, shared across projects |
+| **4th** | `DEFAULT_CONFIG` in `src/types.ts` |
 
 ### Task-Level Timeout
 

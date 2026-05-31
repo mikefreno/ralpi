@@ -1,7 +1,7 @@
 {
-  "name": "ralpi-loop",
-  "version": "1.0.0",
-  "description": "Execute tasks from task files using DAG-based dependency resolution with persistent progress tracking",
+  "name": "ralpi",
+  "version": "0.1.0",
+  "description": "Execute tasks from task files/PRD's using DAG-based dependency resolution with persistent progress tracking",
   "main": "dist/index.js",
   "keywords": [
     "pi-package",

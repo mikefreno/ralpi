@@ -82,32 +82,35 @@ export function findProgressFile(
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-function parseSimpleYaml(content: string): Record<string, any> {
-	const result: Record<string, any> = {};
-	const lines = content.split("\n");
-
-	for (const line of lines) {
-		const trimmed = line.trim();
-		if (!trimmed || trimmed.startsWith("#")) continue;
-
-		const match = trimmed.match(/^([^:]+):\s*(.+)$/);
-		if (match) {
-			const key = match[1].trim();
-			let value: string | boolean | number = match[2].trim();
-
-			// Parse booleans
-			if (value === "true") value = true;
-			else if (value === "false") value = false;
-			// Parse numbers
-			else if (/^\d+$/.test(value)) value = parseInt(value, 10);
-			else if (/^\d+\.\d+$/.test(value)) value = parseFloat(value);
-
-			result[key] = value;
-		}
+/** Try to use the `yaml` package (real dependency in package.json).
+ *  Falls back to a flat key:value parser when unavailable. */
+const parseSimpleYaml: (content: string) => Record<string, any> = (() => {
+	try {
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		const { parse } = require("yaml");
+		return (content: string) => parse(content) ?? {};
+	} catch {
+		return (content: string) => {
+			const result: Record<string, any> = {};
+			for (const line of content.split("\n")) {
+				const trimmed = line.trim();
+				if (!trimmed || trimmed.startsWith("#")) continue;
+				const match = trimmed.match(/^([^:]+):\s*(.*)$/);
+				if (match) {
+					const value = match[2].trim();
+					if (value === "true") result[match[1].trim()] = true;
+					else if (value === "false") result[match[1].trim()] = false;
+					else if (/^\d+$/.test(value))
+						result[match[1].trim()] = parseInt(value, 10);
+					else if (/^\d+\.\d+$/.test(value))
+						result[match[1].trim()] = parseFloat(value);
+					else result[match[1].trim()] = value;
+				}
+			}
+			return result;
+		};
 	}
-
-	return result;
-}
+})();
 
 /**
  * Deep merge configuration objects
@@ -129,25 +132,44 @@ function mergeConfig(
 	return result as RalpiConfig;
 }
 
+/** Path to the global ralpi config under the user's Pi home directory. */
+const GLOBAL_CONFIG_PATH = path.join(
+	process.env.HOME || "/tmp",
+	".pi",
+	"ralpi",
+	"config.yaml",
+);
+
 /**
- * Load configuration from .ralpi/config.yaml or return defaults
+ * Load and merge config from global and project sources.
+ *
+ * Precedence (highest wins):
+ *   1. Project-level: `<projectDir>/.ralpi/config.yaml`
+ *   2. Global: `~/.pi/ralpi/config.yaml`
+ *   3. `DEFAULT_CONFIG` in `src/types.ts`
  */
 export function loadConfig(projectDir: string): RalpiConfig {
-	const configPath = path.join(projectDir, ".ralpi", "config.yaml");
+	// Start with defaults
+	const merged: RalpiConfig = { ...DEFAULT_CONFIG };
 
-	// Return defaults silently when config file does not exist
-	if (!fs.existsSync(configPath)) {
-		return { ...DEFAULT_CONFIG };
-	}
+	// Layer 1: global config (~/.pi/ralpi/config.yaml)
+	tryLoadConfigFile(GLOBAL_CONFIG_PATH, merged);
 
-	try {
-		const content = fs.readFileSync(configPath, "utf-8");
-		// Simple YAML parsing (key: value format)
-		const config = parseSimpleYaml(content);
-		return mergeConfig(DEFAULT_CONFIG, config);
-	} catch {
-		// Malformed config — fall back to defaults silently
-		return { ...DEFAULT_CONFIG };
+	// Layer 2: project config (.ralpi/config.yaml) — overrides global
+	tryLoadConfigFile(path.join(projectDir, ".ralpi", "config.yaml"), merged);
+
+	return merged;
+
+	/** Attempt to load a single config file and merge into `acc` in place. */
+	function tryLoadConfigFile(filePath: string, acc: RalpiConfig): void {
+		if (!fs.existsSync(filePath)) return;
+		try {
+			const content = fs.readFileSync(filePath, "utf-8");
+			const parsed = parseSimpleYaml(content);
+			Object.assign(acc, mergeConfig(acc, parsed));
+		} catch {
+			// Malformed config — skip silently
+		}
 	}
 }
 
@@ -339,6 +361,8 @@ export async function runAgentSession(
 	onEvent?: (event: AgentSessionEvent) => void,
 	signal?: AbortSignal,
 	sessionFile?: string,
+	model?: unknown,
+	thinkingLevel?: unknown,
 ): Promise<{
 	success: boolean;
 	text: string;
@@ -361,10 +385,13 @@ export async function runAgentSession(
 		? fs.createWriteStream(sessionFile, { flags: "a" })
 		: null;
 
-	// Wire timeout via abort signal
-	const timeoutHandle = setTimeout(() => {
-		if (sessionRef?.session) sessionRef.session.agent.abort();
-	}, timeoutMs);
+	// Wire timeout via abort signal (only when set; 0 means inherit Pi's defaults)
+	let timeoutHandle: NodeJS.Timeout | null = null;
+	if (timeoutMs > 0) {
+		timeoutHandle = setTimeout(() => {
+			if (sessionRef?.session) sessionRef.session.agent.abort();
+		}, timeoutMs);
+	}
 
 	const sessionRef: {
 		session?: Awaited<ReturnType<typeof createAgentSession>>["session"];
@@ -387,6 +414,8 @@ export async function runAgentSession(
 			sessionManager: SessionManager.inMemory(),
 			resourceLoader: loader,
 			tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
+			model: model as any,
+			thinkingLevel: thinkingLevel as any,
 		});
 		sessionRef.session = result.session;
 
@@ -437,7 +466,7 @@ export async function runAgentSession(
 		unsubscribe();
 		result.session.dispose();
 		signal?.removeEventListener("abort", abortHandler);
-		clearTimeout(timeoutHandle);
+		if (timeoutHandle) clearTimeout(timeoutHandle);
 
 		// Flush and close the event stream before returning
 		if (eventStream) {
@@ -463,7 +492,7 @@ export async function runAgentSession(
 			events: [], // streamed to file
 		};
 	} catch (error) {
-		clearTimeout(timeoutHandle);
+		if (timeoutHandle) clearTimeout(timeoutHandle);
 		if (eventStream && !eventStream.destroyed) {
 			eventStream.end();
 		}

@@ -160,6 +160,10 @@ export interface RalpiConfig {
 		/** Custom prompt suffix for reflection extraction */
 		reflectionPrompt: string;
 	};
+	/** Parent session model to inherit in child agent sessions */
+	model?: unknown;
+	/** Parent session thinking level to inherit in child agent sessions */
+	thinkingLevel?: unknown;
 }
 
 export const DEFAULT_CONFIG: RalpiConfig = {
@@ -168,9 +172,9 @@ export const DEFAULT_CONFIG: RalpiConfig = {
 		reflectionsDir: ".ralpi/reflections",
 	},
 	execution: {
-		maxRetries: 3,
-		retryDelayMs: 5000,
-		timeoutMs: 30 * 60 * 1000, // 30 minutes
+		maxRetries: 0,
+		retryDelayMs: 0,
+		timeoutMs: 0, // 0 = inherit Pi's own defaults (no ralpi-level timeout)
 		maxParallel: 3,
 	},
 	prompts: {
