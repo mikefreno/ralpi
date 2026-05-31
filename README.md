@@ -1,6 +1,6 @@
 # Ralpi
 
-Execute tasks from task files using DAG-based dependency resolution with persistent progress tracking.
+Execute tasks from task files until done using DAG-based dependency resolution with persistent progress tracking.
 
 ## Features
 
