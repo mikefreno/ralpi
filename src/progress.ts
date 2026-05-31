@@ -171,7 +171,6 @@ export class ProgressTracker {
 		durationMs: number,
 		reflection?: Reflection,
 		toolUsage?: ToolUsage,
-		sessionFile?: string,
 		outputPreview?: string,
 		commitMessages?: string[],
 		commitSummary?: string,
@@ -183,7 +182,6 @@ export class ProgressTracker {
 		prd.tasks[taskId].durationMs = durationMs;
 		if (reflection) prd.tasks[taskId].reflection = reflection;
 		if (toolUsage) prd.tasks[taskId].toolUsage = toolUsage;
-		if (sessionFile) prd.tasks[taskId].sessionFile = sessionFile;
 		if (outputPreview) prd.tasks[taskId].outputPreview = outputPreview;
 		if (commitMessages) prd.tasks[taskId].commitMessages = commitMessages;
 		if (commitSummary) prd.tasks[taskId].commitSummary = commitSummary;

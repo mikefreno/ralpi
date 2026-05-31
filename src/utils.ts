@@ -432,7 +432,6 @@ export async function runAgentSession(
 	timeoutMs: number,
 	onEvent?: (event: AgentSessionEvent) => void,
 	signal?: AbortSignal,
-	sessionFile?: string,
 	model?: unknown,
 	thinkingLevel?: unknown,
 ): Promise<{
@@ -450,13 +449,6 @@ export async function runAgentSession(
 		bash: 0,
 		other: 0,
 	};
-	// Stream events to file instead of accumulating in memory.
-	// Accumulating caused "Invalid string length" crashes when
-	// JSON.stringify(output.events, null, 2) produced 300+ MB strings.
-	const eventStream = sessionFile
-		? fs.createWriteStream(sessionFile, { flags: "a" })
-		: null;
-
 	// Wire timeout via abort signal (only when set; 0 means inherit Pi's defaults)
 	let timeoutHandle: NodeJS.Timeout | null = null;
 	if (timeoutMs > 0) {
@@ -500,10 +492,6 @@ export async function runAgentSession(
 		let stopReason: string | undefined;
 
 		const unsubscribe = result.session.subscribe((event) => {
-			// Stream event to file (avoids accumulating 300+ MB in memory)
-			if (eventStream) {
-				eventStream.write(JSON.stringify(event) + "\n");
-			}
 			onEvent?.(event);
 
 			if (event.type === "message_end") {
@@ -540,11 +528,6 @@ export async function runAgentSession(
 		signal?.removeEventListener("abort", abortHandler);
 		if (timeoutHandle) clearTimeout(timeoutHandle);
 
-		// Flush and close the event stream before returning
-		if (eventStream) {
-			await new Promise<void>((resolve) => eventStream.end(resolve));
-		}
-
 		if (errorMessage && !finalText) {
 			return {
 				success: false,
@@ -561,19 +544,16 @@ export async function runAgentSession(
 			text: finalText.trim(),
 			toolUsage,
 			stopReason,
-			events: [], // streamed to file
+			events: [],
 		};
 	} catch (error) {
 		if (timeoutHandle) clearTimeout(timeoutHandle);
-		if (eventStream && !eventStream.destroyed) {
-			eventStream.end();
-		}
 		return {
 			success: false,
 			text: "",
 			error: error instanceof Error ? error.message : String(error),
 			toolUsage,
-			events: [], // streamed to file
+			events: [],
 		};
 	} finally {
 		sessionRef.session?.dispose();

@@ -155,7 +155,6 @@ export async function runTask(
 	durationMs: number;
 	toolUsage?: ToolUsage;
 	outputPreview?: string;
-	sessionFile?: string;
 	commitMessages?: string[];
 	commitSummary?: string;
 }> {
@@ -168,12 +167,6 @@ export async function runTask(
 		depReflections,
 		config.prompts.projectContext,
 	);
-
-	// Write prompt to .ralpi/ with timestamp (for debugging)
-	const ralpiDir = path.join(projectDir, ".ralpi");
-	ensureDir(ralpiDir);
-	const promptFile = path.join(ralpiDir, `prompt-${startMs}.md`);
-	writeFileSafe(promptFile, prompt);
 
 	const taskHeader = `${task.id} · ${task.title}`;
 
@@ -262,11 +255,6 @@ export async function runTask(
 	// Use task-level timeout if set, otherwise fall back to config
 	const timeoutMs = task.timeoutMs ?? config.execution.timeoutMs;
 
-	// Pre-create session file path so events stream to disk (avoids 300+ MB in-memory accumulation)
-	const sessionsDir = path.join(ralpiDir, "sessions");
-	ensureDir(sessionsDir);
-	const sessionFilePath = path.join(sessionsDir, `${task.id}-${startMs}.txt`);
-
 	// Run task asynchronously via Pi SDK — event loop stays responsive
 	const output = await runAgentSession(
 		prompt,
@@ -291,7 +279,6 @@ export async function runTask(
 			}
 		},
 		undefined, // no abort signal
-		sessionFilePath, // stream events to file
 		assignedModel ?? config.model,
 		config.thinkingLevel,
 	);
@@ -318,7 +305,6 @@ export async function runTask(
 			success: false,
 			error: output.error,
 			durationMs,
-			sessionFile: sessionFilePath, // events streamed to file for debugging
 		};
 	}
 
@@ -328,13 +314,10 @@ export async function runTask(
 	// Capture git commits made during this task
 	const { commitMessages, commitSummary } = captureGitCommits(projectDir);
 
-	// Session file already written by runAgentSession (events streamed to disk)
-	const sessionFile = sessionFilePath;
-
 	// Build output preview (first 500 chars of agent text)
 	const outputPreview =
 		agentText.length > 500
-			? agentText.slice(0, 500) + "\n... (truncated, see session file)"
+			? agentText.slice(0, 500) + "\n... (truncated)"
 			: agentText;
 
 	// Extract reflection from agent output
@@ -350,7 +333,6 @@ export async function runTask(
 		durationMs,
 		toolUsage,
 		outputPreview,
-		sessionFile,
 		commitMessages,
 		commitSummary,
 	};
@@ -702,7 +684,6 @@ async function executeTask(
 						result.durationMs,
 						result.reflection,
 						result.toolUsage,
-						result.sessionFile,
 						result.outputPreview,
 						result.commitMessages,
 						result.commitSummary,

@@ -97,8 +97,6 @@ export interface TaskProgressInfo {
 	error?: string;
 	/** Tool usage counts from parsed subprocess output */
 	toolUsage?: ToolUsage;
-	/** Path to session output file */
-	sessionFile?: string;
 	/** Truncated output preview for expanded view */
 	outputPreview?: string;
 	/** Git commit messages from task execution */
