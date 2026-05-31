@@ -74,6 +74,8 @@ export async function runTask(
 	// Live progress widget above the editor — animated spinner + tool call tree
 	// Using setWidget instead of setWorkingMessage because the working message area
 	// is only visible during parent agent streaming, not during extension command execution.
+	// Widget key is unique per task so parallel tasks each get their own widget.
+	const widgetKey = `ralph-task-${task.id}`;
 	const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 	let frameIndex = 0;
 	const theme = ctx.ui.theme;
@@ -102,7 +104,7 @@ export async function runTask(
 			}
 		}
 
-		ctx.ui.setWidget("ralph-task", lines);
+		ctx.ui.setWidget(widgetKey, lines);
 	};
 
 	// Smooth spinner animation at 100ms intervals
@@ -138,7 +140,7 @@ export async function runTask(
 
 	// Clear progress widget and status after task finishes
 	clearInterval(spinnerTimer);
-	ctx.ui.setWidget("ralph-task", undefined);
+	ctx.ui.setWidget(widgetKey, undefined);
 	ctx.ui.setStatus("ralph", undefined);
 
 	if (!output.success) {

@@ -90,7 +90,10 @@ function parseFioFormat(
 		if (inDeps) {
 			// Format 2: Arrow notation with multiple targets
 			// "01 -> 02,03,06 (description)" means 02, 03, 06 depend on 01
-			const arrowMatch = line.match(/^(\d+)\s*->\s*([\d,\s]+?)(?:\s*\(|$)/);
+			// Supports optional markdown list prefix: "- 01 -> 02,03,06"
+			const arrowMatch = line.match(
+				/^(?:\s*[-*]\s+)?(\d+)\s*->\s*([\d,\s]+?)(?:\s*\(|$)/,
+			);
 			if (arrowMatch) {
 				const [, from, targets] = arrowMatch;
 				const fromId = `0${from}`;
@@ -108,7 +111,10 @@ function parseFioFormat(
 			}
 
 			// Format 1: Natural language "X depends on A, B, C"
-			const dependsMatch = line.match(/^(\d+)\s+depends\s+on\s+([\d,\s]+)/i);
+			// Supports optional markdown list prefix: "- 13 depends on 17, 18, 19"
+			const dependsMatch = line.match(
+				/^(?:\s*[-*]\s+)?(\d+)\s+depends\s+on\s+([\d,\s]+)/i,
+			);
 			if (dependsMatch) {
 				const [, taskId, depsList] = dependsMatch;
 				const taskIdPadded = `0${taskId}`;

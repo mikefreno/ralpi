@@ -356,6 +356,10 @@ async function handleRun(
 	const mode = await selectExecutionMode(ctx, project, taskFile);
 	const plan = buildPlanByMode(mode, project, completed);
 
+	// Show execution plan before starting so user can see batch breakdown
+	const formattedPlan = formatExecutionPlan(plan);
+	ctx.ui.notify(`${formattedPlan}\n\nStarting ${mode} execution...`, "info");
+
 	await executePlanBatches(
 		plan,
 		project,
