@@ -29,6 +29,15 @@ export interface Task {
 	index?: number;
 }
 
+export interface ParallelGroup {
+	/** Group index (0-based, determines execution order) */
+	index: number;
+	/** Human-readable label for the group (e.g. "Play Store prep") */
+	label?: string;
+	/** Task IDs in this group — all can run concurrently */
+	taskIds: string[];
+}
+
 export interface Project {
 	/** Project-level objective / goal */
 	objective?: string;
@@ -36,6 +45,8 @@ export interface Project {
 	tasks: Task[];
 	/** Explicit dependency map: taskId → [dependency taskIds] */
 	dependencies: Record<string, string[]>;
+	/** Explicit parallel groups from "can be done in parallel" declarations */
+	parallelGroups?: ParallelGroup[];
 	/** Exit criteria (from README ## Exit Criteria section) */
 	exitCriteria?: string[];
 	/** Path to the source task file */

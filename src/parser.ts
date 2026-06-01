@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Task, Project } from "./types";
+import type { Task, Project, ParallelGroup } from "./types";
 
 // Lazy-loaded yaml package
 let YAML_module: typeof import("yaml") | undefined;
@@ -56,6 +56,7 @@ function parseFioFormat(
 	const lines = content.split("\n");
 	const tasks: Task[] = [];
 	const dependencies: Record<string, string[]> = {};
+	const parallelGroups: ParallelGroup[] = [];
 	let inTasks = false;
 	let inDeps = false;
 
@@ -151,8 +152,9 @@ function parseFioFormat(
 
 			// Format 1: Natural language "X depends on A, B, C"
 			// Supports optional markdown list prefix: "- 13 depends on 17, 18, 19"
+			// Also handles "also depends on": "- 08 also depends on 05, 06"
 			const dependsMatch = line.match(
-				/^(?:\s*[-*]\s+)?(\d+)\s+depends\s+on\s+([\d,\s]+)/i,
+				/^(?:\s*[-*]\s+)?(\d+)\s+(?:also\s+)?depends\s+on\s+([\d,\s]+)/i,
 			);
 			if (dependsMatch) {
 				const [, taskId, depsList] = dependsMatch;
@@ -164,7 +166,11 @@ function parseFioFormat(
 					.map((t) => t.padStart(2, "0"));
 
 				if (!dependencies[taskIdPadded]) dependencies[taskIdPadded] = [];
-				dependencies[taskIdPadded].push(...depIds);
+				for (const depId of depIds) {
+					if (!dependencies[taskIdPadded].includes(depId)) {
+						dependencies[taskIdPadded].push(depId);
+					}
+				}
 			}
 
 			// Parse meta blocks for task configuration (timeout, etc.)
@@ -176,6 +182,91 @@ function parseFioFormat(
 				const task = tasks.find((t) => t.id === taskId.padStart(2, "0"));
 				if (task) {
 					task.timeoutMs = parseTimeoutValue(Number(value), unit);
+				}
+			}
+
+			// Format 2: "X, Y, Z can be done in parallel (label)"
+			// "- 01, 02, 03, 04 can be done in parallel (Play Store prep)"
+			const parallelMatch = line.match(
+				/^(?:\s*[-*]\s+)?((?:0?\d+\s*,\s*)*0?\d+)\s+can\s+be\s+done\s+in\s+parallel(?:\s+\(([^)]+)\))?$/i,
+			);
+			if (parallelMatch) {
+				const [, idsStr, label] = parallelMatch;
+				const taskIds = idsStr
+					.split(",")
+					.map((t) => t.trim())
+					.filter((t) => /^\d+$/.test(t))
+					.map((t) => t.padStart(2, "0"));
+
+				if (taskIds.length > 0) {
+					parallelGroups.push({
+						index: parallelGroups.length,
+						label: label ? label.trim() : undefined,
+						taskIds,
+					});
+				}
+			}
+
+			// Format 3: "A must be done before B, C" or "A, B must be done before C"
+			// "- 21 must be done before 22, 23, 24 (backend integration foundation)"
+			// "- 02, 03 must be done before 04"
+			const mustBeforeMatch = line.match(
+				/^(?:\s*[-*]\s+)?((?:0?\d+\s*,\s*)*0?\d+)\s+must\s+be\s+done\s+before\s+((?:0?\d+\s*,\s*)*0?\d+)(?:\s+\(([^)]+)\))?$/i,
+			);
+			if (mustBeforeMatch) {
+				const [, fromIdsStr, toIdsStr] = mustBeforeMatch;
+				const fromIds = fromIdsStr
+					.split(",")
+					.map((t) => t.trim())
+					.filter((t) => /^\d+$/.test(t))
+					.map((t) => t.padStart(2, "0"));
+				const toIds = toIdsStr
+					.split(",")
+					.map((t) => t.trim())
+					.filter((t) => /^\d+$/.test(t))
+					.map((t) => t.padStart(2, "0"));
+
+				// Each "to" task depends on ALL "from" tasks
+				for (const toId of toIds) {
+					if (!dependencies[toId]) dependencies[toId] = [];
+					for (const fromId of fromIds) {
+						if (!dependencies[toId].includes(fromId)) {
+							dependencies[toId].push(fromId);
+						}
+					}
+				}
+			}
+
+			// Format 4: "X, Y, Z depend on A" or "X depends on A, B, C"
+			// "- 22, 23, 24 depend on 21"
+			// "- 05, 06 depend on 02, 03, 04"
+			// "- 08 also depends on 05, 06"  ("also" is ignored)
+			// Strip optional "also" before matching
+			const cleanedLine = line.replace(/\balso\b/i, "");
+			const dependOnMatch = cleanedLine.match(
+				/^(?:\s*[-*]\s+)?((?:0?\d+\s*,\s*)*0?\d+)\s+depend(?:s)?\s+on\s+((?:0?\d+\s*,\s*)*0?\d+)(?:\s+\(([^)]+)\))?$/i,
+			);
+			if (dependOnMatch) {
+				const [, fromIdsStr, toIdsStr] = dependOnMatch;
+				const fromIds = fromIdsStr
+					.split(",")
+					.map((t) => t.trim())
+					.filter((t) => /^\d+$/.test(t))
+					.map((t) => t.padStart(2, "0"));
+				const toIds = toIdsStr
+					.split(",")
+					.map((t) => t.trim())
+					.filter((t) => /^\d+$/.test(t))
+					.map((t) => t.padStart(2, "0"));
+
+				// Each "from" task depends on ALL "to" tasks
+				for (const fromId of fromIds) {
+					if (!dependencies[fromId]) dependencies[fromId] = [];
+					for (const toId of toIds) {
+						if (!dependencies[fromId].includes(toId)) {
+							dependencies[fromId].push(toId);
+						}
+					}
 				}
 			}
 		}
@@ -203,9 +294,20 @@ function parseFioFormat(
 		}
 	}
 
+	// Apply parallelGroup to tasks
+	for (const group of parallelGroups) {
+		for (const taskId of group.taskIds) {
+			const task = tasks.find((t) => t.id === taskId);
+			if (task) {
+				task.parallelGroup = group.index;
+			}
+		}
+	}
+
 	return {
 		tasks,
 		dependencies,
+		parallelGroups: parallelGroups.length > 0 ? parallelGroups : undefined,
 		sourcePath,
 		sourceDir,
 		exitCriteria,
