@@ -102,25 +102,50 @@ function parseFioFormat(
 		}
 
 		if (inDeps) {
-			// Format 2: Arrow notation with multiple targets
-			// "01 -> 02,03,06 (description)" means 02, 03, 06 depend on 01
+			// Arrow notation (supports both -> and unicode \u2192)
+			// "01 -> 02,03,06" means 02, 03, 06 depend on 01
+			// "02 \u2192 08" — single arrow with unicode
+			// "03 \u2192 04 \u2192 05" — chained: 04 depends on 03, 05 depends on 04
+			// "05, 07, 08 \u2192 13" — multi-prereq: 13 depends on 05, 07, 08
 			// Supports optional markdown list prefix: "- 01 -> 02,03,06"
-			const arrowMatch = line.match(
-				/^(?:\s*[-*]\s+)?(\d+)\s*->\s*([\d,\s]+?)(?:\s*\(|$)/,
-			);
-			if (arrowMatch) {
-				const [, from, targets] = arrowMatch;
-				const fromId = from.padStart(2, "0");
-				const targetIds = targets
-					.split(",")
-					.map((t) => t.trim())
-					.filter((t) => t)
-					.map((t) => t.padStart(2, "0"));
+			const hasArrow = /->/.test(line) || /\u2192/.test(line);
+			if (hasArrow) {
+				// Strip optional list prefix and parenthetical description
+				const cleaned = line
+					.replace(/^(\s*[-*]\s+)?/, "")
+					.replace(/\s*\(.*\)\s*$/, "");
 
-				// Each target depends on the source
-				for (const toId of targetIds) {
-					if (!dependencies[toId]) dependencies[toId] = [];
-					dependencies[toId].push(fromId);
+				// Split on arrows to get segments
+				const segments = cleaned
+					.split(/->|\u2192/)
+					.map((s) => s.trim())
+					.filter(Boolean);
+
+				if (segments.length >= 2) {
+					for (let i = 0; i < segments.length - 1; i++) {
+						// Left segment: source(s) (comma-separated)
+						const fromIds = segments[i]
+							.split(",")
+							.map((t) => t.trim())
+							.filter((t) => /^\d+$/.test(t))
+							.map((t) => t.padStart(2, "0"));
+
+						// Right segment: target(s) (comma-separated)
+						const toIds = segments[i + 1]
+							.split(",")
+							.map((t) => t.trim())
+							.filter((t) => /^\d+$/.test(t))
+							.map((t) => t.padStart(2, "0"));
+
+						for (const toId of toIds) {
+							if (!dependencies[toId]) dependencies[toId] = [];
+							for (const fromId of fromIds) {
+								if (!dependencies[toId].includes(fromId)) {
+									dependencies[toId].push(fromId);
+								}
+							}
+						}
+					}
 				}
 			}
 
