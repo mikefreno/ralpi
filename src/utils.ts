@@ -580,6 +580,53 @@ function extractAssistantText(content: unknown): string {
 // ─── Git Commit Capture ──────────────────────────────────────────────────────
 
 /**
+ * Check if there are any uncommitted changes in the git repository.
+ */
+export function hasUncommittedChanges(projectDir: string): boolean {
+	const { execSync } = require("node:child_process");
+	try {
+		const output = execSync("git status --porcelain", {
+			cwd: projectDir,
+			encoding: "utf-8",
+		}).trim();
+		return output.length > 0;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Get the current git status in porcelain format.
+ * Includes untracked files, which `git diff` alone would miss.
+ */
+export function getGitStatusPorcelain(projectDir: string): string {
+	const { execSync } = require("node:child_process");
+	try {
+		return execSync("git status --porcelain", {
+			cwd: projectDir,
+			encoding: "utf-8",
+		}).trim();
+	} catch {
+		return "";
+	}
+}
+
+/**
+ * Get the current git diff for tracked uncommitted changes.
+ */
+export function getGitDiff(projectDir: string): string {
+	const { execSync } = require("node:child_process");
+	try {
+		return execSync("git diff", {
+			cwd: projectDir,
+			encoding: "utf-8",
+		}).trim();
+	} catch {
+		return "";
+	}
+}
+
+/**
  * Capture recent git commits made during task execution
  * Returns commit messages and a summary string
  */

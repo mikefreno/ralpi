@@ -11,6 +11,9 @@ import {
 	writeFileSafe,
 	ensureDir,
 	captureGitCommits,
+	hasUncommittedChanges,
+	getGitStatusPorcelain,
+	getGitDiff,
 	formatDuration,
 } from "./utils";
 import { updateTaskInFile } from "./parser";
@@ -673,6 +676,76 @@ async function executeTask(
 				);
 
 				if (result.success) {
+					// ── Auto-Commit: Trigger follow-up agent session for uncommitted changes ──
+					let finalCommitMessages = result.commitMessages ?? [];
+					let finalCommitSummary = result.commitSummary ?? "";
+
+					try {
+						if (hasUncommittedChanges(projectDir)) {
+							const status = getGitStatusPorcelain(projectDir);
+							const diff = getGitDiff(projectDir);
+							const commitPrompt = [
+								`## Auto-Commit for Task ${task.id}: ${task.title}`,
+								"",
+								"The previous task is complete. There are uncommitted changes in the repository.",
+								"",
+								"First stage all intended changes with `git add -A` (including untracked files), then create a meaningful git commit.",
+								"Use a descriptive commit message and follow conventional commits format.",
+								"",
+								"### Current Changes (git status --porcelain)",
+								"```text",
+								status || "(no status output)",
+								"```",
+								"",
+								"### Current Tracked Diff (git diff)",
+								"```diff",
+								diff || "(no tracked diff output)",
+								"```",
+							].join("\n");
+
+							// Use a short timeout for the commit session (60s should be enough)
+							const commitTimeout = Math.min(
+								60_000,
+								config.execution.timeoutMs,
+							);
+							const commitResult = await runAgentSession(
+								commitPrompt,
+								projectDir,
+								commitTimeout,
+								undefined,
+								undefined,
+								currentModel,
+								config.thinkingLevel,
+							);
+
+							if (commitResult.success) {
+								// Re-capture commits made during this follow-up session
+								const newCommits = captureGitCommits(projectDir);
+								if (newCommits.commitMessages.length > 0) {
+									finalCommitMessages = [
+										...finalCommitMessages,
+										...newCommits.commitMessages,
+									];
+									finalCommitSummary = finalCommitSummary
+										? `${finalCommitSummary}; ${newCommits.commitSummary}`
+										: newCommits.commitSummary;
+								}
+								sendChatMessage?.(`✓ commit for ${task.id} · ${task.title}`);
+							} else {
+								sendChatMessage?.(
+									`~ commit for ${task.id} · ${task.title} — follow-up commit session failed: ${commitResult.error}`,
+								);
+							}
+						}
+					} catch (error) {
+						// Don't fail the task if auto-commit fails
+						sendChatMessage?.(
+							`~ commit for ${task.id} · ${task.title} — auto-commit error: ${
+								error instanceof Error ? error.message : String(error)
+							}`,
+						);
+					}
+
 					// Save reflection
 					if (result.reflection) {
 						saveReflectionToFile(projectDir, config, result.reflection);
@@ -685,8 +758,8 @@ async function executeTask(
 						result.reflection,
 						result.toolUsage,
 						result.outputPreview,
-						result.commitMessages,
-						result.commitSummary,
+						finalCommitMessages,
+						finalCommitSummary,
 					);
 					// Auto-update the PRD source file checkbox
 					try {
