@@ -24,7 +24,7 @@ export function getBlockedTasks(
 		for (const task of pendingTasks) {
 			if (blocked.has(task.id)) continue;
 			const deps = task.dependencies || [];
-			if (deps.some((dep) => failedTaskIds.has(dep))) {
+			if (deps.some((dep) => failedTaskIds.has(dep) || blocked.has(dep))) {
 				blocked.add(task.id);
 				changed = true;
 			}
@@ -46,9 +46,15 @@ export function buildExecutionPlan(
 	parallelGroup?: number,
 	failedTaskIds: Set<string> = new Set(),
 ): ExecutionPlan {
-	// Filter out already completed tasks
-	const pendingTasks = project.tasks.filter((t) => !completed.has(t.id));
-	const skippedTasks = project.tasks.filter((t) => completed.has(t.id));
+	// Filter out already completed AND failed tasks
+	// Failed tasks should not be re-scheduled — they're only re-attempted
+	// via the retry mechanism inside executeTask, not via the DAG.
+	const pendingTasks = project.tasks.filter(
+		(t) => !completed.has(t.id) && !failedTaskIds.has(t.id),
+	);
+	const skippedTasks = project.tasks.filter(
+		(t) => completed.has(t.id) || failedTaskIds.has(t.id),
+	);
 
 	// With explicitly declared parallel groups, all groups are independent.
 	// Since there are no cross-group dependencies by definition, standard

@@ -44,8 +44,27 @@ export function parseTaskFile(filePath: string): Project {
 
 // ─── Fio Format Parser ───────────────────────────────────────────────────────
 
+/** Match both markdown heading (## Dependencies) and plain heading (Dependencies). */
+const DEP_HEADING_RE = /^(?:##\s+)?Dependencies\s*$/m;
+/** Match both markdown heading (## Tasks) and plain heading (Tasks). */
+const TASK_HEADING_RE = /^(?:##\s+)?Tasks\s*$/m;
+/** Match other markdown headings (## Something). */
+const ANY_MD_HEADING_RE = /^##\s/;
+/**
+ * Detect a plain (non-markdown) section heading like "Exit criteria".
+ * A plain heading must:
+ *   - Start with a letter
+ *   - Contain only letters and spaces
+ *   - Have no colons (avoids matching "Objective:" and "Status legend:")
+ *   - Not be a task/dep line (doesn't start with "-")
+ */
+function isPlainSectionHeader(line: string): boolean {
+	const trimmed = line.trim();
+	return trimmed.length > 0 && /^[A-Za-z][A-Za-z\s]*$/.test(trimmed);
+}
+
 function hasDependenciesSection(content: string): boolean {
-	return /^##\s+Dependencies\s*$/m.test(content);
+	return DEP_HEADING_RE.test(content);
 }
 
 function parseFioFormat(
@@ -61,20 +80,21 @@ function parseFioFormat(
 	let inDeps = false;
 
 	for (const line of lines) {
-		if (/^##\s+Tasks\s*$/m.test(line)) {
+		if (TASK_HEADING_RE.test(line)) {
 			inTasks = true;
 			inDeps = false;
 			continue;
 		}
-		if (/^##\s+Dependencies\s*$/m.test(line)) {
+		if (DEP_HEADING_RE.test(line)) {
 			inTasks = false;
 			inDeps = true;
 			continue;
 		}
+		// Reset state on any other section heading — both ##-style and plain
 		if (
-			/^##\s/.test(line) &&
-			!/^##\s+Tasks/.test(line) &&
-			!/^##\s+Dependencies/.test(line)
+			(ANY_MD_HEADING_RE.test(line) || isPlainSectionHeader(line)) &&
+			!TASK_HEADING_RE.test(line) &&
+			!DEP_HEADING_RE.test(line)
 		) {
 			inTasks = false;
 			inDeps = false;
@@ -272,12 +292,14 @@ function parseFioFormat(
 		}
 	}
 
-	// Extract exit criteria
+	// Extract exit criteria — detect both ## Exit Criteria and plain Exit criteria
 	const exitCriteria: string[] = [];
-	const exitIdx = lines.findIndex((l) => /^##\s+Exit\s+Criteria/i.test(l));
+	const exitCriteriaRe = /^(?:##\s+)?Exit\s+Criteria/i;
+	const exitIdx = lines.findIndex((l) => exitCriteriaRe.test(l));
 	if (exitIdx >= 0) {
 		for (let i = exitIdx + 1; i < lines.length; i++) {
-			if (/^##\s/.test(lines[i])) break;
+			// Stop at any new section heading (##-style or plain)
+			if (/^##\s/.test(lines[i]) || isPlainSectionHeader(lines[i])) break;
 			const m = lines[i].match(/^-\s+(.+)$/);
 			if (m) exitCriteria.push(m[1].trim());
 		}
@@ -419,9 +441,14 @@ export function updateTaskInFile(
 	const char = statusToChar(status);
 
 	// Strategy 1: Fio numbered format — match by explicit task ID in the file
-	// Try both padded (01) and raw (1) variations
-	const rawId = parseInt(taskId, 10).toString();
-	const idPatterns = new Set([escapeRegex(taskId), escapeRegex(rawId)]);
+	// Try both padded (01) and raw (1) variations.
+	// When the task ID is already zero-padded (e.g., "01"), skip the raw ID
+	// to avoid partial matches ("1" matching the second digit of "01").
+	const idPatterns = new Set([escapeRegex(taskId)]);
+	if (!taskId.startsWith("0")) {
+		const rawId = parseInt(taskId, 10).toString();
+		idPatterns.add(escapeRegex(rawId));
+	}
 
 	for (const idPattern of idPatterns) {
 		const fioRegex = new RegExp(

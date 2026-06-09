@@ -867,27 +867,40 @@ function sleep(ms: number): Promise<void> {
 // ─── Tool Call Formatting ────────────────────────────────────────────────
 
 /**
+ * Strip control characters and newlines from a display label so it
+ * does not break TUI layout (tree branches, text width calculation).
+ */
+function sanitizeLabel(s: string): string {
+	// Replace newlines/carriage returns with spaces (multi-line commands
+	// must fit on a single tree-branch line), then strip ASCII control
+	// characters except \t (which is harmless) and keep printable chars.
+	return s
+		.replace(/\r?\n/g, " ")
+		.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+		.trim();
+}
+
+/**
  * Format a tool call argument into a short label.
  */
 function formatToolArg(name: string, args: unknown): string {
 	const a = args as Record<string, unknown>;
 	switch (name) {
 		case "bash":
-			return truncateMiddle(String(a.command ?? ""), 70);
+			return sanitizeLabel(truncateMiddle(String(a.command ?? ""), 70));
 		case "write":
 		case "read":
-			return truncateMiddle(String(a.path ?? ""), 60);
+			return sanitizeLabel(truncateMiddle(String(a.path ?? ""), 60));
 		case "edit":
-			return truncateMiddle(String(a.path ?? ""), 60);
+			return sanitizeLabel(truncateMiddle(String(a.path ?? ""), 60));
 		case "grep":
-			return `${a.pattern ?? "?"} — ${truncateMiddle(
-				String(a.path ?? ""),
-				40,
-			)}`;
+			return sanitizeLabel(
+				`${a.pattern ?? "?"} — ${truncateMiddle(String(a.path ?? ""), 40)}`,
+			);
 		case "find":
-			return `${a.path ?? "."} — ${a.glob ?? "*"}`;
+			return sanitizeLabel(`${a.path ?? "."} — ${a.glob ?? "*"}`);
 		case "ls":
-			return truncateMiddle(String(a.path ?? "."), 60);
+			return sanitizeLabel(truncateMiddle(String(a.path ?? "."), 60));
 		default:
 			return name;
 	}

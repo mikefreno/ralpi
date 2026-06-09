@@ -194,7 +194,11 @@ async function executePlanBatches(
 
 			// In parallel mode, rebuild the plan to filter out newly blocked tasks
 			if (mode === "parallel") {
-				const completed = new Set(progress.getCompletedTaskIds());
+				// Use buildCompletedSet to include file-based [x] completions
+				// (progress.getCompletedTaskIds() only knows about tasks completed
+				// during THIS execution session — tasks that were already [x] in the
+				// file before the run started would be re-included and re-executed).
+				const completed = buildCompletedSet(progress, project);
 				const newPlan = buildExecutionPlan(
 					project,
 					completed,
@@ -354,17 +358,33 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 			}
 		};
 
+		/**
+		 * Strip control characters and newlines from a display label so it
+		 * does not break TUI layout (tree branches, text width calculation).
+		 */
+		function sanitizeLabel(s: string): string {
+			return s
+				.replace(/\r?\n/g, " ")
+				.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+				.trim();
+		}
+
 		/** Format a tool call argument into a short label. */
 		function formatToolLabel(name: string, args: unknown): string {
 			const a = args as Record<string, unknown> | undefined;
 			if (!a) return name;
-			if (name === "bash") return String(a.command ?? "").slice(0, 70);
+			if (name === "bash")
+				return sanitizeLabel(String(a.command ?? "").slice(0, 70));
 			if (name === "write" || name === "read" || name === "edit")
-				return String(a.path ?? "").slice(0, 60);
+				return sanitizeLabel(String(a.path ?? "").slice(0, 60));
 			if (name === "grep")
-				return `${a.pattern ?? "?"} — ${String(a.path ?? "").slice(0, 40)}`;
-			if (name === "find") return `${a.path ?? "."} — ${a.glob ?? "*"}`;
-			if (name === "ls") return String(a.path ?? ".").slice(0, 60);
+				return sanitizeLabel(
+					`${a.pattern ?? "?"} — ${String(a.path ?? "").slice(0, 40)}`,
+				);
+			if (name === "find")
+				return sanitizeLabel(`${a.path ?? "."} — ${a.glob ?? "*"}`);
+			if (name === "ls")
+				return sanitizeLabel(String(a.path ?? ".").slice(0, 60));
 			return name;
 		}
 
