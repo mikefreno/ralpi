@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Task, Project, ParallelGroup } from "./types";
+import type { Task, Project, ParallelGroup, Phase } from "./types";
 
 // Lazy-loaded yaml package
 let YAML_module: typeof import("yaml") | undefined;
@@ -22,6 +22,7 @@ function loadYaml(): typeof import("yaml") {
  * Parse a task file (markdown or YAML) into a Project structure.
  * Supports:
  * - Fio README format (numbered tasks with dependency graph)
+ * - Phased format (## Phase N — Title sections with tasks and dependencies)
  * - Simple checkbox format (- [ ] task)
  * - YAML format (tasks: [...])
  */
@@ -36,7 +37,7 @@ export function parseTaskFile(filePath: string): Project {
 	}
 
 	// Markdown: detect format
-	if (hasDependenciesSection(content)) {
+	if (hasDependenciesSection(content) || hasPhaseHeadings(content)) {
 		return parseFioFormat(content, absolutePath, dir);
 	}
 	return parseSimpleCheckbox(content, absolutePath, dir);
@@ -50,6 +51,10 @@ const DEP_HEADING_RE = /^(?:##\s+)?Dependencies\s*$/m;
 const TASK_HEADING_RE = /^(?:##\s+)?Tasks\s*$/m;
 /** Match other markdown headings (## Something). */
 const ANY_MD_HEADING_RE = /^##\s/;
+/** Match phase headings: ## Phase 1 — Push-to-Talk MVP */
+const PHASE_HEADING_RE = /^\s*##\s+Phase\s+(\d+)\s*[—–:-]\s*(.+)$/i;
+/** Detect plain phase headings too: Phase 1 — Title (no ##) */
+const PHASE_HEADING_PLAIN_RE = /^Phase\s+(\d+)\s*[—–:-]\s*(.+)$/i;
 /**
  * Detect a plain (non-markdown) section heading like "Exit criteria".
  * A plain heading must:
@@ -67,6 +72,10 @@ function hasDependenciesSection(content: string): boolean {
 	return DEP_HEADING_RE.test(content);
 }
 
+function hasPhaseHeadings(content: string): boolean {
+	return PHASE_HEADING_RE.test(content) || PHASE_HEADING_PLAIN_RE.test(content);
+}
+
 function parseFioFormat(
 	content: string,
 	sourcePath: string,
@@ -76,10 +85,38 @@ function parseFioFormat(
 	const tasks: Task[] = [];
 	const dependencies: Record<string, string[]> = {};
 	const parallelGroups: ParallelGroup[] = [];
+	const phases: Phase[] = [];
+	let currentPhase: number | null = null;
+	let currentPhaseTitle = "";
 	let inTasks = false;
 	let inDeps = false;
 
 	for (const line of lines) {
+		// Check for phase headings first
+		const phaseMatch =
+			line.match(PHASE_HEADING_RE) || line.match(PHASE_HEADING_PLAIN_RE);
+		if (phaseMatch) {
+			// Save previous phase if exists
+			if (currentPhase !== null) {
+				const phaseTaskIds = tasks
+					.filter((t) => t.phase === currentPhase)
+					.map((t) => t.id);
+				if (phaseTaskIds.length > 0) {
+					phases.push({
+						number: currentPhase,
+						title: currentPhaseTitle,
+						taskIds: phaseTaskIds,
+					});
+				}
+			}
+			// Start new phase
+			currentPhase = parseInt(phaseMatch[1], 10);
+			currentPhaseTitle = phaseMatch[2].trim();
+			inTasks = true;
+			inDeps = false;
+			continue;
+		}
+
 		if (TASK_HEADING_RE.test(line)) {
 			inTasks = true;
 			inDeps = false;
@@ -91,10 +128,13 @@ function parseFioFormat(
 			continue;
 		}
 		// Reset state on any other section heading — both ##-style and plain
+		// BUT NOT phase headings (already handled above)
 		if (
 			(ANY_MD_HEADING_RE.test(line) || isPlainSectionHeader(line)) &&
 			!TASK_HEADING_RE.test(line) &&
-			!DEP_HEADING_RE.test(line)
+			!DEP_HEADING_RE.test(line) &&
+			!PHASE_HEADING_RE.test(line) &&
+			!PHASE_HEADING_PLAIN_RE.test(line)
 		) {
 			inTasks = false;
 			inDeps = false;
@@ -118,6 +158,7 @@ function parseFioFormat(
 					dependencies: [],
 					timeoutMs,
 					index: tasks.length,
+					phase: currentPhase ?? undefined,
 				});
 			}
 		}
@@ -292,6 +333,43 @@ function parseFioFormat(
 		}
 	}
 
+	// Save final phase if we were in one
+	if (currentPhase !== null) {
+		const phaseTaskIds = tasks
+			.filter((t) => t.phase === currentPhase)
+			.map((t) => t.id);
+		if (phaseTaskIds.length > 0) {
+			phases.push({
+				number: currentPhase,
+				title: currentPhaseTitle,
+				taskIds: phaseTaskIds,
+			});
+		}
+	}
+
+	// Add implicit phase-boundary dependencies
+	// First task of each phase (except phase 1) depends on last task of previous phase
+	if (phases.length > 1) {
+		for (let i = 1; i < phases.length; i++) {
+			const prevPhase = phases[i - 1];
+			const currPhase = phases[i];
+			if (prevPhase.taskIds.length === 0 || currPhase.taskIds.length === 0)
+				continue;
+
+			const lastTaskOfPrevPhase =
+				prevPhase.taskIds[prevPhase.taskIds.length - 1];
+			const firstTaskOfCurrPhase = currPhase.taskIds[0];
+
+			// Add dependency if not already present
+			if (!dependencies[firstTaskOfCurrPhase]) {
+				dependencies[firstTaskOfCurrPhase] = [];
+			}
+			if (!dependencies[firstTaskOfCurrPhase].includes(lastTaskOfPrevPhase)) {
+				dependencies[firstTaskOfCurrPhase].push(lastTaskOfPrevPhase);
+			}
+		}
+	}
+
 	// Extract exit criteria — detect both ## Exit Criteria and plain Exit criteria
 	const exitCriteria: string[] = [];
 	const exitCriteriaRe = /^(?:##\s+)?Exit\s+Criteria/i;
@@ -330,6 +408,7 @@ function parseFioFormat(
 		tasks,
 		dependencies,
 		parallelGroups: parallelGroups.length > 0 ? parallelGroups : undefined,
+		phases: phases.length > 0 ? phases : undefined,
 		sourcePath,
 		sourceDir,
 		exitCriteria,

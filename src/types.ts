@@ -27,6 +27,8 @@ export interface Task {
 	timeoutMs?: number;
 	/** Original index in task list for deterministic ordering */
 	index?: number;
+	/** Phase number this task belongs to (1-indexed, from ## Phase N headings) */
+	phase?: number;
 }
 
 export interface ParallelGroup {
@@ -35,6 +37,15 @@ export interface ParallelGroup {
 	/** Human-readable label for the group (e.g. "Play Store prep") */
 	label?: string;
 	/** Task IDs in this group — all can run concurrently */
+	taskIds: string[];
+}
+
+export interface Phase {
+	/** Phase number (1-indexed, matches the heading number) */
+	number: number;
+	/** Phase title (e.g. "Push-to-Talk MVP") */
+	title: string;
+	/** Task IDs in this phase, in order */
 	taskIds: string[];
 }
 
@@ -47,6 +58,8 @@ export interface Project {
 	dependencies: Record<string, string[]>;
 	/** Explicit parallel groups from "can be done in parallel" declarations */
 	parallelGroups?: ParallelGroup[];
+	/** Phased sections from ## Phase N headings (in order) */
+	phases?: Phase[];
 	/** Exit criteria (from README ## Exit Criteria section) */
 	exitCriteria?: string[];
 	/** Path to the source task file */
