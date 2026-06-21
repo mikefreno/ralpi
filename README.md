@@ -54,29 +54,45 @@ tasks:
     depends_on: ["01"]
 ```
 
+## Task IDs
+
+Task IDs are zero-padded 2-digit strings (`01`, `02`, ...) with an optional
+single lowercase letter suffix for sub-tasks inserted between two numbered
+steps (e.g. `02b`, `02c`). The parser normalizes `2b` → `02b`.
+
+```
+- [ ] 01 — Setup
+- [ ] 02 — Fix bugs
+- [ ] 02b — Sub-step of 02 (inserted after the fact)
+- [ ] 02c — Another sub-step of 02
+- [ ] 03 — Continue
+```
+
+Use lettered sub-tasks when you discover mid-stream that a step needs to be
+split. They let you preserve sibling numbering (`01`, `02`, `03`, ...) while
+adding granularity between two existing steps.
+
 ## Dependencies
 
-### Arrow Notation (recommended):
+### Arrow Notation (recommended)
 
 1 -> 2,3,4
 5 -> 6
 This means: "Task 1 must complete before tasks 2, 3, and 4 can start."
 
-### Natural Language:
+### Natural Language
 
 13 depends on 17, 18, 19, 20
 14 depends on 13, 15, 16
 
 This means: "Task 13 depends on tasks 17, 18, 19, and 20."
 
-### Parallel Groups (informational only):
+### Parallel Groups (informational only)
 
 1, 2, 3, 4 can be done in parallel
 5, 6, 7, 8 can be done in parallel
 
 Note: These lines are ignored by the parser. Use explicit dependencies to control execution order.
-
-
 
 ## Configuration
 
@@ -90,7 +106,6 @@ You can set a timeout for individual tasks using a meta block in the task file:
 ```
 
 Supported formats: `10m` (minutes), `600s` (seconds), `3600000` (milliseconds)
-
 
 ### Config files
 

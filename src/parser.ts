@@ -142,15 +142,17 @@ function parseFioFormat(
 		}
 
 		if (inTasks) {
-			// Match all tasks on a line (supports compact single-line formats)
+			// Match all tasks on a line (supports compact single-line formats).
+			// ID is digits optionally followed by a single lowercase letter
+			// (e.g. "01", "02b", "10c") — see normalizeTaskId for the shape.
 			const taskPattern =
-				/-+\s+\[(.)\]\s+(\d+)\s+[—–:-]\s+(.+?)(?:\s+(?=-+\s+\[)|\s*→\s*`([^`]+)`|$)/g;
+				/-+\s+\[(.)\]\s+(\d+[a-z]?)\s+[—–:-]\s+(.+?)(?:\s+(?=-+\s+\[)|\s*→\s*`([^`]+)`|$)/g;
 			let match: RegExpExecArray | null;
 			while ((match = taskPattern.exec(line)) !== null) {
 				const [, status, id, title, file] = match;
 				const timeoutMs = parseTimeoutFromLine(line);
 				tasks.push({
-					id: id.padStart(2, "0"),
+					id: normalizeTaskId(id),
 					title: title.trim(),
 					description: undefined,
 					file: file || undefined,
@@ -189,15 +191,15 @@ function parseFioFormat(
 						const fromIds = segments[i]
 							.split(",")
 							.map((t) => t.trim())
-							.filter((t) => /^\d+$/.test(t))
-							.map((t) => t.padStart(2, "0"));
+							.filter((t) => /^\d+[a-z]?$/.test(t))
+							.map((t) => normalizeTaskId(t));
 
 						// Right segment: target(s) (comma-separated)
 						const toIds = segments[i + 1]
 							.split(",")
 							.map((t) => t.trim())
-							.filter((t) => /^\d+$/.test(t))
-							.map((t) => t.padStart(2, "0"));
+							.filter((t) => /^\d+[a-z]?$/.test(t))
+							.map((t) => normalizeTaskId(t));
 
 						for (const toId of toIds) {
 							if (!dependencies[toId]) dependencies[toId] = [];
@@ -214,17 +216,20 @@ function parseFioFormat(
 			// Format 1: Natural language "X depends on A, B, C"
 			// Supports optional markdown list prefix: "- 13 depends on 17, 18, 19"
 			// Also handles "also depends on": "- 08 also depends on 05, 06"
+			// The dep list char class includes lowercase letters so lettered IDs
+			// (e.g. "02b") don't truncate the capture. Per-id validation is
+			// done by the filter below, so trailing prose can't leak in.
 			const dependsMatch = line.match(
-				/^(?:\s*[-*]\s+)?(\d+)\s+(?:also\s+)?depends\s+on\s+([\d,\s]+)/i,
+				/^(?:\s*[-*]\s+)?(\d+[a-z]?)\s+(?:also\s+)?depends\s+on\s+([\d,\s a-z]+)/i,
 			);
 			if (dependsMatch) {
 				const [, taskId, depsList] = dependsMatch;
-				const taskIdPadded = taskId.padStart(2, "0");
+				const taskIdPadded = normalizeTaskId(taskId);
 				const depIds = depsList
 					.split(",")
 					.map((t) => t.trim())
-					.filter((t) => t)
-					.map((t) => t.padStart(2, "0"));
+					.filter((t) => /^\d+[a-z]?$/.test(t))
+					.map((t) => normalizeTaskId(t));
 
 				if (!dependencies[taskIdPadded]) dependencies[taskIdPadded] = [];
 				for (const depId of depIds) {
@@ -236,11 +241,11 @@ function parseFioFormat(
 
 			// Parse meta blocks for task configuration (timeout, etc.)
 			const metaMatch = line.match(
-				/^0?(\d+)\s+\[timeout\]\s*=?\s*(\d+)(?:m|min|s|ms)?/i,
+				/^0?(\d+[a-z]?)\s+\[timeout\]\s*=?\s*(\d+)(?:m|min|s|ms)?/i,
 			);
 			if (metaMatch) {
 				const [, taskId, value, unit] = metaMatch;
-				const task = tasks.find((t) => t.id === taskId.padStart(2, "0"));
+				const task = tasks.find((t) => t.id === normalizeTaskId(taskId));
 				if (task) {
 					task.timeoutMs = parseTimeoutValue(Number(value), unit);
 				}
@@ -249,15 +254,15 @@ function parseFioFormat(
 			// Format 2: "X, Y, Z can be done in parallel (label)"
 			// "- 01, 02, 03, 04 can be done in parallel (Play Store prep)"
 			const parallelMatch = line.match(
-				/^(?:\s*[-*]\s+)?((?:0?\d+\s*,\s*)*0?\d+)\s+can\s+be\s+done\s+in\s+parallel(?:\s+\(([^)]+)\))?$/i,
+				/^(?:\s*[-*]\s+)?((?:0?\d+[a-z]?\s*,\s*)*0?\d+[a-z]?)\s+can\s+be\s+done\s+in\s+parallel(?:\s+\(([^)]+)\))?$/i,
 			);
 			if (parallelMatch) {
 				const [, idsStr, label] = parallelMatch;
 				const taskIds = idsStr
 					.split(",")
 					.map((t) => t.trim())
-					.filter((t) => /^\d+$/.test(t))
-					.map((t) => t.padStart(2, "0"));
+					.filter((t) => /^\d+[a-z]?$/.test(t))
+					.map((t) => normalizeTaskId(t));
 
 				if (taskIds.length > 0) {
 					parallelGroups.push({
@@ -272,20 +277,20 @@ function parseFioFormat(
 			// "- 21 must be done before 22, 23, 24 (backend integration foundation)"
 			// "- 02, 03 must be done before 04"
 			const mustBeforeMatch = line.match(
-				/^(?:\s*[-*]\s+)?((?:0?\d+\s*,\s*)*0?\d+)\s+must\s+be\s+done\s+before\s+((?:0?\d+\s*,\s*)*0?\d+)(?:\s+\(([^)]+)\))?$/i,
+				/^(?:\s*[-*]\s+)?((?:0?\d+[a-z]?\s*,\s*)*0?\d+[a-z]?)\s+must\s+be\s+done\s+before\s+((?:0?\d+[a-z]?\s*,\s*)*0?\d+[a-z]?)(?:\s+\(([^)]+)\))?$/i,
 			);
 			if (mustBeforeMatch) {
 				const [, fromIdsStr, toIdsStr] = mustBeforeMatch;
 				const fromIds = fromIdsStr
 					.split(",")
 					.map((t) => t.trim())
-					.filter((t) => /^\d+$/.test(t))
-					.map((t) => t.padStart(2, "0"));
+					.filter((t) => /^\d+[a-z]?$/.test(t))
+					.map((t) => normalizeTaskId(t));
 				const toIds = toIdsStr
 					.split(",")
 					.map((t) => t.trim())
-					.filter((t) => /^\d+$/.test(t))
-					.map((t) => t.padStart(2, "0"));
+					.filter((t) => /^\d+[a-z]?$/.test(t))
+					.map((t) => normalizeTaskId(t));
 
 				// Each "to" task depends on ALL "from" tasks
 				for (const toId of toIds) {
@@ -305,20 +310,20 @@ function parseFioFormat(
 			// Strip optional "also" before matching
 			const cleanedLine = line.replace(/\balso\b/i, "");
 			const dependOnMatch = cleanedLine.match(
-				/^(?:\s*[-*]\s+)?((?:0?\d+\s*,\s*)*0?\d+)\s+depend(?:s)?\s+on\s+((?:0?\d+\s*,\s*)*0?\d+)(?:\s+\(([^)]+)\))?$/i,
+				/^(?:\s*[-*]\s+)?((?:0?\d+[a-z]?\s*,\s*)*0?\d+[a-z]?)\s+depend(?:s)?\s+on\s+((?:0?\d+[a-z]?\s*,\s*)*0?\d+[a-z]?)(?:\s+\(([^)]+)\))?$/i,
 			);
 			if (dependOnMatch) {
 				const [, fromIdsStr, toIdsStr] = dependOnMatch;
 				const fromIds = fromIdsStr
 					.split(",")
 					.map((t) => t.trim())
-					.filter((t) => /^\d+$/.test(t))
-					.map((t) => t.padStart(2, "0"));
+					.filter((t) => /^\d+[a-z]?$/.test(t))
+					.map((t) => normalizeTaskId(t));
 				const toIds = toIdsStr
 					.split(",")
 					.map((t) => t.trim())
-					.filter((t) => /^\d+$/.test(t))
-					.map((t) => t.padStart(2, "0"));
+					.filter((t) => /^\d+[a-z]?$/.test(t))
+					.map((t) => normalizeTaskId(t));
 
 				// Each "from" task depends on ALL "to" tasks
 				for (const fromId of fromIds) {
@@ -519,12 +524,13 @@ export function updateTaskInFile(
 	let content = fs.readFileSync(filePath, "utf-8");
 	const char = statusToChar(status);
 
-	// Strategy 1: Fio numbered format — match by explicit task ID in the file
-	// Try both padded (01) and raw (1) variations.
-	// When the task ID is already zero-padded (e.g., "01"), skip the raw ID
-	// to avoid partial matches ("1" matching the second digit of "01").
+	// Strategy 1: Fio numbered format — match by explicit task ID in the file.
+	// For pure-digit IDs, also try the parsed numeric form (parity with the
+	// pre-lettered behavior). Lettered IDs ("02b", "02c") only have one valid
+	// form — the parseInt fallback would silently drop the letter suffix and
+	// create false-positive partial matches, so we skip it for them.
 	const idPatterns = new Set([escapeRegex(taskId)]);
-	if (!taskId.startsWith("0")) {
+	if (!taskId.startsWith("0") && /^\d+$/.test(taskId)) {
 		const rawId = parseInt(taskId, 10).toString();
 		idPatterns.add(escapeRegex(rawId));
 	}
@@ -579,7 +585,12 @@ function updateTaskInYaml(
 	const tasks = doc.get("tasks");
 	if (!tasks || !YAML.isSeq(tasks)) return;
 
-	const rawId = parseInt(taskId, 10).toString();
+	// Build alternate ID forms for matching. For lettered IDs ("02b"), the
+	// verbatim form is the only valid pattern — parseInt would drop the suffix.
+	const idVariants: string[] = [taskId];
+	if (/^\d+$/.test(taskId)) {
+		idVariants.push(parseInt(taskId, 10).toString());
+	}
 
 	// Strategy 1: Match by explicit id field
 	for (const item of tasks.items) {
@@ -587,7 +598,7 @@ function updateTaskInYaml(
 		const idVal = item.get("id");
 		if (idVal === undefined || idVal === null) continue;
 		const idStr = String(idVal);
-		if (idStr === taskId || idStr === rawId) {
+		if (idVariants.includes(idStr)) {
 			item.set("status", status);
 			fs.writeFileSync(filePath, String(doc), "utf-8");
 			return;
@@ -701,6 +712,28 @@ function parseTimeoutFromMeta(
 	}
 
 	return undefined;
+}
+
+/**
+ * Normalize a task ID: zero-pad the digit portion to 2 chars, preserve any
+ * single lowercase letter suffix. Idempotent on already-normalized IDs.
+ *
+ *   "1"   → "01"
+ *   "2"   → "02"
+ *   "2b"  → "02b"
+ *   "02b" → "02b"
+ *   "10"  → "10"
+ *   "10b" → "10b"
+ *
+ * Pass-through for IDs that don't match the expected shape (defensive — the
+ * upstream regexes restrict matches, but a stray value should not be silently
+ * re-shaped).
+ */
+function normalizeTaskId(id: string): string {
+	const match = id.match(/^(\d+)([a-z])?$/);
+	if (!match) return id;
+	const [, digits, letter] = match;
+	return digits.padStart(2, "0") + (letter ?? "");
 }
 
 function charToStatus(char: string): Task["status"] {

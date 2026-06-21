@@ -1028,3 +1028,294 @@ describe("Plain section headings (no ##)", () => {
 		}
 	});
 });
+
+// ─── Lettered Step IDs (e.g. 02b, 02c) ────────────────────────────────────
+
+describe("Lettered step IDs (e.g. 02b, 02c)", () => {
+	it("parses task lines with a single lowercase letter suffix", () => {
+		const content = `${FIO_HEADER}
+- [~] 01 — Revert terminology
+- [ ] 02 — Fix lesson generation
+- [ ] 02b — Create lesson sequence adapter
+- [ ] 02c — Add tap to show translation
+- [ ] 03 — Restore web curriculum overview
+
+${FIO_FOOTER}
+- 02 -> 02b
+- 02 -> 02c
+`;
+		const { project, cleanup } = parse(content);
+		try {
+			expect(project.tasks).toHaveLength(5);
+			expect(project.tasks.map((t) => t.id)).toEqual([
+				"01",
+				"02",
+				"02b",
+				"02c",
+				"03",
+			]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("normalizes unpadded lettered IDs (2b -> 02b)", () => {
+		const content = `${FIO_HEADER}
+- [ ] 2 — First
+- [ ] 2b — Sub-step
+- [ ] 2c — Another sub-step
+- [ ] 3 — Third
+
+${FIO_FOOTER}
+`;
+		const { project, cleanup } = parse(content);
+		try {
+			const ids = project.tasks.map((t) => t.id);
+			expect(ids).toEqual(["02", "02b", "02c", "03"]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("preserves lettered IDs in natural-language depends-on", () => {
+		const content = `${FIO_HEADER}
+- [ ] 02 — Fix bugs
+- [ ] 02b — Adapter
+- [ ] 02c — Translation
+- [ ] 04 — Restore unit detail
+
+${FIO_FOOTER}
+- 02b depends on 02
+- 02c depends on 02
+- 04 depends on 01, 02b, 03
+`;
+		const { project, cleanup } = parse(content);
+		try {
+			expect(project.tasks.find((t) => t.id === "02b")!.dependencies).toEqual([
+				"02",
+			]);
+			expect(project.tasks.find((t) => t.id === "02c")!.dependencies).toEqual([
+				"02",
+			]);
+			expect(
+				project.tasks.find((t) => t.id === "04")!.dependencies.sort(),
+			).toEqual(["01", "02b", "03"]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("handles 'also depends on' with lettered IDs", () => {
+		const content = `${FIO_HEADER}
+- [ ] 02 — First
+- [ ] 02b — Sub
+
+${FIO_FOOTER}
+- 02b also depends on 02
+`;
+		const { project, cleanup } = parse(content);
+		try {
+			expect(project.tasks.find((t) => t.id === "02b")!.dependencies).toEqual([
+				"02",
+			]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("handles arrow notation with lettered targets", () => {
+		const content = `${FIO_HEADER}
+- [ ] 02 — Source
+- [ ] 02b — Target b
+- [ ] 02c — Target c
+- [ ] 03 — End
+
+${FIO_FOOTER}
+- 02 -> 02b, 02c
+- 02b, 02c -> 03
+`;
+		const { project, cleanup } = parse(content);
+		try {
+			expect(project.tasks.find((t) => t.id === "02b")!.dependencies).toEqual([
+				"02",
+			]);
+			expect(project.tasks.find((t) => t.id === "02c")!.dependencies).toEqual([
+				"02",
+			]);
+			expect(
+				project.tasks.find((t) => t.id === "03")!.dependencies.sort(),
+			).toEqual(["02b", "02c"]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("handles 'must be done before' with lettered IDs", () => {
+		const content = `${FIO_HEADER}
+- [ ] 02 — Before
+- [ ] 02b — Sub b
+- [ ] 02c — Sub c
+- [ ] 03 — After
+
+${FIO_FOOTER}
+- 02 must be done before 02b, 02c
+- 02b must be done before 03
+`;
+		const { project, cleanup } = parse(content);
+		try {
+			expect(project.tasks.find((t) => t.id === "02b")!.dependencies).toEqual([
+				"02",
+			]);
+			expect(project.tasks.find((t) => t.id === "02c")!.dependencies).toEqual([
+				"02",
+			]);
+			expect(project.tasks.find((t) => t.id === "03")!.dependencies).toEqual([
+				"02b",
+			]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("handles 'depend on' with lettered IDs", () => {
+		const content = `${FIO_HEADER}
+- [ ] 02 — Foundation
+- [ ] 03 — Foundation
+- [ ] 02b — Needs both
+
+${FIO_FOOTER}
+- 02b depends on 02, 03
+`;
+		const { project, cleanup } = parse(content);
+		try {
+			expect(
+				project.tasks.find((t) => t.id === "02b")!.dependencies.sort(),
+			).toEqual(["02", "03"]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("handles 'can be done in parallel' with lettered IDs", () => {
+		const content = `${FIO_HEADER}
+- [ ] 02b — Adapter
+- [ ] 02c — Translation
+- [ ] 05 — Final
+
+${FIO_FOOTER}
+- 02b, 02c can be done in parallel (post-fix polish)
+`;
+		const { project, cleanup } = parse(content);
+		try {
+			expect(project.parallelGroups).toBeDefined();
+			const group = project.parallelGroups![0];
+			expect(group.taskIds.sort()).toEqual(["02b", "02c"]);
+			expect(group.label).toBe("post-fix polish");
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("parses timeout meta block for a lettered ID", () => {
+		// Timeout meta blocks live in the Dependencies section, not inline
+		// with the task. Format: "02b [timeout] = 15m" (no list prefix).
+		const content = `${FIO_HEADER}
+- [ ] 02b — Adapter
+
+${FIO_FOOTER}
+02b [timeout] = 15m
+`;
+		const { project, cleanup } = parse(content);
+		try {
+			const task = project.tasks.find((t) => t.id === "02b")!;
+			expect(task.timeoutMs).toBe(15 * 60 * 1000);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("parses the full Linear UI Reintegration example", () => {
+		const content = `# Linear UI Reintegration
+
+Objective: Reintegrate the original linear unit progression UI while retaining the pool-based v2 backend, hiding all pool internals from the user. Also fix critical lesson generation bugs (word repetition, introduction dedup, learning-pool cap) and add tap-to-show-translation.
+
+Status legend: [ ] todo, [~] in-progress, [x] done
+
+Tasks
+
+- [~] 01 — revert-terminology-and-url-scheme
+- [ ] 02 — fix-lesson-generation-bugs
+- [ ] 02b — create-lesson-sequence-adapter
+- [ ] 02c — add-tap-to-show-translation
+- [ ] 03 — restore-web-curriculum-overview
+- [ ] 04 — restore-web-linear-path-unit-detail
+- [ ] 05 — wire-web-lesson-player-to-v2
+- [ ] 06 — remove-pool-exposing-web-ui
+- [ ] 07 — restore-ios-curriculum-linear-view
+- [ ] 08 — bridge-ios-lesson-flow-to-v2
+- [ ] 09 — remove-pool-exposing-ios-ui
+- [ ] 10 — e2e-testing-and-validation
+
+Dependencies
+
+- 02b depends on 02
+- 04 depends on 01, 02b, 03
+- 05 depends on 02b, 02c, 04
+- 06 depends on 03, 04, 05
+- 08 depends on 02b, 02c, 07
+- 09 depends on 07, 08
+- 10 depends on 05, 06, 08, 09
+`;
+		const { project, cleanup } = parse(content);
+		try {
+			expect(project.tasks).toHaveLength(12);
+			expect(project.objective).toBe("Linear UI Reintegration");
+
+			// Lettered IDs land in the right slot
+			const t2b = project.tasks.find((t) => t.id === "02b")!;
+			const t2c = project.tasks.find((t) => t.id === "02c")!;
+			expect(t2b.title).toBe("create-lesson-sequence-adapter");
+			expect(t2c.title).toBe("add-tap-to-show-translation");
+
+			// 02b depends on 02
+			expect(t2b.dependencies).toEqual(["02"]);
+			expect(t2c.dependencies).toEqual([]);
+
+			// 04 depends on 01, 02b, 03
+			expect(
+				project.tasks.find((t) => t.id === "04")!.dependencies.sort(),
+			).toEqual(["01", "02b", "03"]);
+
+			// 05 depends on 02b, 02c, 04
+			expect(
+				project.tasks.find((t) => t.id === "05")!.dependencies.sort(),
+			).toEqual(["02b", "02c", "04"]);
+
+			// 10 depends on 05, 06, 08, 09
+			expect(
+				project.tasks.find((t) => t.id === "10")!.dependencies.sort(),
+			).toEqual(["05", "06", "08", "09"]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("preserves 02b in task title normalization (id 02b vs 02)", () => {
+		const content = `${FIO_HEADER}
+- [ ] 02 — Step two
+- [ ] 02b — Step two-b
+- [ ] 02c — Step two-c
+
+${FIO_FOOTER}
+`;
+		const { project, cleanup } = parse(content);
+		try {
+			const ids = project.tasks.map((t) => t.id);
+			expect(ids).toEqual(["02", "02b", "02c"]);
+			// All three are distinct
+			expect(new Set(ids).size).toBe(3);
+		} finally {
+			cleanup();
+		}
+	});
+});
