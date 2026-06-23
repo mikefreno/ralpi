@@ -706,20 +706,115 @@ async function executeTask(
 								"```",
 							].join("\n");
 
+							// ── Commit widget setup ──
+							const commitWidgetKey = `ralpi-commit-${task.id}`;
+							let commitFrameIndex = 0;
+							const commitToolCalls: ToolCallEntry[] = [];
+							let commitWidgetTui: { requestRender(): void } | null = null;
+
+							const commitHeader = `commit for ${task.id} · ${task.title}`;
+
+							const buildCommitLines = (
+								t: typeof ctx.ui.theme,
+								width?: number,
+							): string[] => {
+								const effectiveWidth = width || 74;
+								const frame = t.fg(
+									"accent",
+									SPINNER_FRAMES[commitFrameIndex % SPINNER_FRAMES.length],
+								);
+								const lines = [
+									truncateToWidth(`~ ${frame} ${commitHeader}`, effectiveWidth),
+								];
+
+								if (commitToolCalls.length > 0) {
+									if (commitToolCalls.length <= MAX_COLLAPSED) {
+										for (let i = 0; i < commitToolCalls.length; i++) {
+											const entry = commitToolCalls[i];
+											const isLast = i === commitToolCalls.length - 1;
+											const branch = isLast ? "  └── " : "  ├── ";
+											const tag = t.fg("accent", `[${entry.name}]`);
+											lines.push(
+												truncateToWidth(
+													`${branch}${tag} ${entry.label}`,
+													effectiveWidth,
+												),
+											);
+										}
+									} else {
+										const shown = commitToolCalls.slice(-MAX_COLLAPSED);
+										const remaining = commitToolCalls.length - shown.length;
+										lines.push(
+											truncateToWidth(
+												t.fg("dim", `  ├── …${remaining} earlier`),
+												effectiveWidth,
+											),
+										);
+										for (let i = 0; i < shown.length; i++) {
+											const entry = shown[i];
+											const isLast = i === shown.length - 1;
+											const branch = isLast ? "  └── " : "  ├── ";
+											const tag = t.fg("accent", `[${entry.name}]`);
+											lines.push(
+												truncateToWidth(
+													`${branch}${tag} ${entry.label}`,
+													effectiveWidth,
+												),
+											);
+										}
+									}
+								}
+								return lines;
+							};
+
+							ctx.ui.setWidget(commitWidgetKey, (tui, t) => {
+								commitWidgetTui = tui;
+								return {
+									render: (width?: number) => buildCommitLines(t, width),
+									invalidate: () => commitWidgetTui?.requestRender(),
+								};
+							});
+
+							const requestCommitRender = () =>
+								commitWidgetTui?.requestRender();
+
+							const commitSpinnerTimer = setInterval(() => {
+								commitFrameIndex =
+									(commitFrameIndex + 1) % SPINNER_FRAMES.length;
+								requestCommitRender();
+							}, 100);
+
 							// Use a short timeout for the commit session (60s should be enough)
 							const commitTimeout = Math.min(
 								60_000,
 								config.execution.timeoutMs,
 							);
-							const commitResult = await runAgentSession(
-								commitPrompt,
-								projectDir,
-								commitTimeout,
-								undefined,
-								undefined,
-								currentModel,
-								config.thinkingLevel,
-							);
+
+							let commitResult: Awaited<ReturnType<typeof runAgentSession>>;
+
+							try {
+								commitResult = await runAgentSession(
+									commitPrompt,
+									projectDir,
+									commitTimeout,
+									(event) => {
+										if (event.type === "tool_execution_start") {
+											const label = formatToolArg(event.toolName, event.args);
+											commitToolCalls.push({
+												name: event.toolName,
+												label,
+											});
+											requestCommitRender();
+										}
+									},
+									undefined,
+									currentModel,
+									config.thinkingLevel,
+								);
+							} finally {
+								clearInterval(commitSpinnerTimer);
+								ctx.ui.setWidget(commitWidgetKey, undefined);
+							}
 
 							if (commitResult.success) {
 								// Re-capture commits made during this follow-up session
@@ -733,10 +828,13 @@ async function executeTask(
 										? `${finalCommitSummary}; ${newCommits.commitSummary}`
 										: newCommits.commitSummary;
 								}
-								sendChatMessage?.(`✓ commit for ${task.id} · ${task.title}`);
+								sendChatMessage?.(`✓ commit for ${task.id} · ${task.title}`, {
+									toolCalls: commitToolCalls,
+								});
 							} else {
 								sendChatMessage?.(
 									`~ commit for ${task.id} · ${task.title} — follow-up commit session failed: ${commitResult.error}`,
+									{ toolCalls: commitToolCalls },
 								);
 							}
 						}

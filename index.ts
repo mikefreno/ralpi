@@ -885,6 +885,20 @@ async function handleResume(
 	const mode = await selectExecutionMode(ctx, project, taskFile, config);
 	const plan = buildPlanByMode(mode, project, completed);
 
+	// Print remaining batches before executing
+	const formattedPlan = formatExecutionPlan(plan);
+	if (mode === "parallel") {
+		ctx.ui.notify(
+			`${formattedPlan}\n\nResuming parallel execution...`,
+			"info",
+		);
+	} else {
+		ctx.ui.notify(
+			`${formattedPlan}\n\nResuming sequential execution...`,
+			"info",
+		);
+	}
+
 	await executePlanBatches(
 		plan,
 		project,
