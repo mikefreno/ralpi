@@ -115,7 +115,6 @@ export interface TaskProgressInfo {
 	status: Task["status"];
 	startedAt?: string;
 	completedAt?: string;
-	retries: number;
 	durationMs?: number;
 	reflection?: Reflection;
 	error?: string;
@@ -167,16 +166,31 @@ export interface RalpiConfig {
 		reflectionsDir: string;
 	};
 	execution: {
-		/** Maximum retries per task */
-		maxRetries: number;
-		/** Delay between retries in milliseconds */
-		retryDelayMs: number;
 		/** Task execution timeout in milliseconds */
 		timeoutMs: number;
 		/** Maximum parallel tasks (0 = unlimited) */
 		maxParallel: number;
 		/** Round-robin model list for parallel tasks (empty = inherit parent model) */
 		models: string[];
+		/** Spawn a follow-up agent to commit changes after each task completes */
+		autoCommit: boolean;
+		/** Spawn a review agent to review the commit against the task description */
+		autoReview: boolean;
+		/** Keys under `execution:` explicitly present in a loaded config YAML.
+		 *  Used to skip interactive prompts for fields the user already set. */
+		explicitKeys?: Set<string>;
+		/** Model for commit sessions in <provider>/<model> format (empty = inherit task model) */
+		commitModel: string;
+		/** Model for review sessions in <provider>/<model> format (empty = inherit task model) */
+		reviewModel: string;
+		/** Model for task implementation in <provider>/<model> format (empty = inherit parent model; only used in sequential mode when models is empty) */
+		implModel: string;
+		/** Timeout for auto-commit agent sessions in milliseconds */
+		commitTimeoutMs: number;
+		/** Timeout for auto-review agent sessions in milliseconds */
+		reviewTimeoutMs: number;
+		/** Maximum total duration for the entire loop execution in milliseconds (0 = no limit). Checked between batches — in-progress tasks finish naturally. */
+		loopTimeoutMs: number;
 	};
 	prompts: {
 		/** Additional context injected into every task prompt */
@@ -196,11 +210,17 @@ export const DEFAULT_CONFIG: RalpiConfig = {
 		reflectionsDir: ".ralpi/reflections",
 	},
 	execution: {
-		maxRetries: 0,
-		retryDelayMs: 0,
 		timeoutMs: 0, // 0 = inherit Pi's own defaults (no ralpi-level timeout)
 		maxParallel: 3,
 		models: [],
+		autoCommit: true,
+		autoReview: false,
+		commitModel: "",
+		reviewModel: "",
+		implModel: "",
+		commitTimeoutMs: 0, // 0 = inherit Pi's own defaults (no ralpi-level timeout)
+		reviewTimeoutMs: 0, // 0 = inherit Pi's own defaults (no ralpi-level timeout)
+		loopTimeoutMs: 0, // 0 = no limit
 	},
 	prompts: {
 		projectContext: "",

@@ -120,6 +120,15 @@ execution:
   models:                 # round-robin in <provider>/<model> format
     - google/gemini-3.5-flash # 1st and 3rd task in parallel
     - openai/gpt-5.5 # 2nd task in parallel
+  autoCommit: true        # spawn a commit agent after each task completes
+  autoReview: false        # spawn a review agent to review each commit
+  implModel: ""           # model for task impl (sequential mode, empty = inherit parent)
+  commitModel: ""         # model for commit sessions (empty = inherit task model)
+  reviewModel: ""         # model for review sessions (empty = inherit task model)
+  timeoutMs: 0            # per-task timeout in ms (0 = inherit Pi's defaults)
+  commitTimeoutMs: 60000  # timeout for auto-commit agent sessions
+  reviewTimeoutMs: 120000 # timeout for auto-review agent sessions
+  loopTimeoutMs: 0        # max total loop duration in ms (0 = no limit)
 prompts:
   projectContext: "Additional context for all tasks"
 ```
@@ -133,6 +142,20 @@ prompts:
 > as a task failure. Each model is tried once before the task is marked as failed.
 > **NOTE**: this is only used in parallel execution, in sequential mode the
 > parent pi session's model is used
+
+#### Auto-commit and Auto-review
+
+When `autoCommit` is enabled (default), a follow-up agent session is spawned
+after each task to stage and commit uncommitted changes. When `autoReview` is
+enabled, a second follow-up session reviews the latest commit against the task
+description. Both options can be overridden at loop startup via a selection
+prompt.
+
+`commitModel` and `reviewModel` accept `<provider>/<model>` strings (e.g.
+`anthropic/claude-sonnet-4`) resolved via the model registry. When empty, the
+task's model is inherited. `implModel` sets the model for task implementation
+in sequential mode (overridden by `execution.models` round-robin in parallel
+mode).
 
 ## State Files
 

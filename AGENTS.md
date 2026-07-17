@@ -19,6 +19,7 @@ No build step needed — Pi loads extensions via [jiti](https://github.com/unjs/
 ## External dependencies
 
 The extension imports from Pi SDK packages (not in `package.json` — provided by the host):
+
 - `@earendil-works/pi-coding-agent` — `ExtensionAPI`, `ExtensionContext`, `createAgentSession`, etc.
 - `@earendil-works/pi-tui` — `Box`, `Text` for custom message renderer
 
@@ -44,6 +45,7 @@ The only real npm dependency is `yaml` (^2.4.0).
 ## Runtime state
 
 All runtime state lives in `.ralpi/` in the **project directory** (not this extension directory):
+
 - `.ralpi/progress.json` — execution progress, supports multiple PRDs
 - `.ralpi/reflections/` — per-task reflection JSON files
 - `.ralpi/prompts/` — generated prompts (timestamped, for debugging)
@@ -59,4 +61,13 @@ Task IDs are zero-padded strings (`"01"`, `"02"`, etc.). The parser prepends `0`
 
 ## Config
 
-Read from `.ralpi/config.yaml` in project directory. Falls back to `DEFAULT_CONFIG` in `src/types.ts` when file is missing. Config is loaded at `projectDir` level, not extension level.
+Read from `.ralpi/config.yaml` in project directory (and global `~/.pi/ralpi/config.yaml`). Falls back to `DEFAULT_CONFIG` in `src/types.ts` when files are missing. Config is loaded at `projectDir` level, not extension level.
+
+Key config fields in `execution`:
+
+- `autoCommit` / `autoReview` — toggle follow-up commit and review agent sessions (also selectable at loop startup via `selectLoopOptions`)
+- `models` — round-robin model list for parallel mode
+- `implModel` / `commitModel` / `reviewModel` — `<provider>/<model>` strings resolved via `resolveModelSpec` in `utils.ts`
+- `commitTimeoutMs` / `reviewTimeoutMs` — timeouts for follow-up sessions
+- `loopTimeoutMs` — max total loop duration in ms (0 = no limit; checked between batches in `executePlanBatches`)
+- `timeoutMs` — per-task execution timeout

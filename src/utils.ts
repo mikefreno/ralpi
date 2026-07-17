@@ -13,6 +13,7 @@ import {
 	DefaultResourceLoader,
 	getAgentDir,
 	SessionManager,
+	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 
 // ─── Directory Helpers ───────────────────────────────────────────────────────
@@ -152,6 +153,70 @@ export function findProgressFile(
 	return null;
 }
 
+/**
+ * List all PRDs from a ProgressState, sorted by lastUpdatedAt descending
+ * (most recent first). Used by resume to offer a selection when multiple
+ * loops have progress simultaneously.
+ */
+export function listPRDsSorted(
+	state: ProgressState,
+): Array<{ key: string; prd: PRDProgress }> {
+	const entries: Array<{ key: string; prd: PRDProgress }> = [];
+
+	if (state.prds) {
+		for (const [key, prd] of Object.entries(state.prds)) {
+			entries.push({ key, prd });
+		}
+	} else {
+		// Legacy flat mode — single PRD
+		entries.push({
+			key: "legacy",
+			prd: {
+				sourcePath: state.sourcePath,
+				tasks: state.tasks,
+				startedAt: state.startedAt,
+				lastUpdatedAt: state.lastUpdatedAt,
+				paused: state.paused,
+			},
+		});
+	}
+
+	entries.sort((a, b) => {
+		return (
+			new Date(b.prd.lastUpdatedAt).getTime() -
+			new Date(a.prd.lastUpdatedAt).getTime()
+		);
+	});
+
+	return entries;
+}
+
+// ─── Model Resolution ───────────────────────────────────────────────────────
+
+/**
+ * Resolve a "<provider>/<model>" spec string via the model registry.
+ * Returns undefined if spec is empty, malformed, or not found.
+ */
+export function resolveModelSpec(
+	modelRegistry:
+		| { find(provider: string, modelId: string): unknown }
+		| undefined,
+	spec: string,
+	onWarning?: (msg: string) => void,
+): unknown | undefined {
+	if (!spec) return undefined;
+	const slashIdx = spec.indexOf("/");
+	if (slashIdx === -1) {
+		onWarning?.(
+			`ralpi config: skipping model "${spec}" — expected <provider>/<model> format`,
+		);
+		return undefined;
+	}
+	const provider = spec.slice(0, slashIdx);
+	const modelId = spec.slice(slashIdx + 1);
+	return modelRegistry?.find(provider, modelId);
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 /** Try to use the `yaml` package (real dependency in package.json).
@@ -239,6 +304,15 @@ export function loadConfig(projectDir: string): RalpiConfig {
 			const content = fs.readFileSync(filePath, "utf-8");
 			const parsed = parseSimpleYaml(content);
 			Object.assign(acc, mergeConfig(acc, parsed));
+			// Track which execution keys were explicitly set in this YAML so the
+			// loop-startup prompts can be skipped for fields the user already set.
+			const exec = parsed?.execution;
+			if (exec && typeof exec === "object" && !Array.isArray(exec)) {
+				acc.execution.explicitKeys ??= new Set<string>();
+				for (const key of Object.keys(exec)) {
+					acc.execution.explicitKeys.add(key);
+				}
+			}
 		} catch {
 			// Malformed config — skip silently
 		}
@@ -434,6 +508,10 @@ export async function runAgentSession(
 	signal?: AbortSignal,
 	model?: unknown,
 	thinkingLevel?: unknown,
+	/** When true, skip loading the skills catalog for this session. Used by
+	 *  focused follow-up sessions (commit/review) that don't need skills —
+	 *  keeps the context lean and avoids dragging in unrelated overhead. */
+	noSkills = false,
 ): Promise<{
 	success: boolean;
 	text: string;
@@ -466,7 +544,7 @@ export async function runAgentSession(
 			cwd,
 			agentDir: getAgentDir(),
 			noExtensions: true,
-			noSkills: false,
+			noSkills,
 			noPromptTemplates: true,
 			noThemes: true,
 			noContextFiles: true,
@@ -477,6 +555,7 @@ export async function runAgentSession(
 			cwd,
 			sessionManager: SessionManager.inMemory(),
 			resourceLoader: loader,
+			settingsManager: SettingsManager.create(cwd, getAgentDir()),
 			tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
 			model: model as any,
 			thinkingLevel: thinkingLevel as any,
@@ -674,4 +753,44 @@ export function captureGitCommits(projectDir: string): {
 	}
 
 	return { commitMessages, commitSummary };
+}
+
+/**
+ * Get the diff of the latest commit (HEAD).
+ * Returns the short hash, subject, and full diff (stat + patch).
+ * Used by the auto-review agent to review a commit against the task.
+ */
+export function getLatestCommitDiff(
+	projectDir: string,
+): { hash: string; subject: string; diff: string } | null {
+	const { execSync } = require("node:child_process");
+
+	try {
+		execSync("git rev-parse --git-dir", { cwd: projectDir, stdio: "pipe" });
+	} catch {
+		return null;
+	}
+
+	try {
+		const hash = execSync("git rev-parse --short HEAD", {
+			cwd: projectDir,
+			encoding: "utf-8",
+		}).trim();
+
+		const subject = execSync("git log -1 --format=%s", {
+			cwd: projectDir,
+			encoding: "utf-8",
+		}).trim();
+
+		// Full diff of the latest commit: stat overview + patch
+		const diff = execSync("git show HEAD --stat --patch", {
+			cwd: projectDir,
+			encoding: "utf-8",
+			maxBuffer: 1024 * 1024,
+		}).trim();
+
+		return { hash, subject, diff };
+	} catch {
+		return null;
+	}
 }

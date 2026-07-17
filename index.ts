@@ -29,6 +29,8 @@ import {
 	deleteLoopActive,
 	readLoopActive,
 	findRalpiDir,
+	listPRDsSorted,
+	formatDuration,
 } from "./src/utils";
 
 const COMMANDS = ["plan", "resume", "reset"] as const;
@@ -120,6 +122,96 @@ function buildPlanByMode(
 		: buildSequentialPlan(project, completed);
 }
 
+/**
+ * Prompt the user to select auto-commit and auto-review options for this loop.
+ * Defaults are taken from config; the user can override at loop startup.
+ * Fields explicitly set in the config YAML are skipped (no prompt).
+ * Returns the selected options (or config defaults if cancelled).
+ */
+async function selectLoopOptions(
+	ctx: ExtensionContext,
+	config: import("./src/types").RalpiConfig,
+): Promise<{ autoCommit: boolean; autoReview: boolean }> {
+	const explicit = config.execution.explicitKeys;
+
+	// Skip the commit prompt when the YAML explicitly sets it.
+	let autoCommit: boolean;
+	if (explicit?.has("autoCommit")) {
+		autoCommit = config.execution.autoCommit;
+	} else {
+		const commitChoice = await ctx.ui.select("Auto-commit after each task?", [
+			"Yes — stage and commit changes automatically",
+			"No — skip auto-commit",
+		]);
+		autoCommit = commitChoice
+			? commitChoice.startsWith("Yes")
+			: config.execution.autoCommit;
+	}
+
+	let autoReview = false;
+	if (autoCommit) {
+		// Skip the review prompt when the YAML explicitly sets it.
+		if (explicit?.has("autoReview")) {
+			autoReview = config.execution.autoReview;
+		} else {
+			const reviewChoice = await ctx.ui.select(
+				"Auto-review each commit against the task?",
+				["Yes — spawn a review agent after each commit", "No — skip review"],
+			);
+			autoReview = reviewChoice
+				? reviewChoice.startsWith("Yes")
+				: config.execution.autoReview;
+		}
+	}
+
+	return { autoCommit, autoReview };
+}
+
+/**
+ * When multiple PRD loops have progress, prompt the user to select which one
+ * to resume. Returns the selected PRD key and sourcePath.
+ * If only one PRD exists, returns it without prompting.
+ * Returns null if no PRDs exist.
+ */
+async function selectPRDToResume(
+	ctx: ExtensionContext,
+	found: NonNullable<ReturnType<typeof findProgressFile>>,
+): Promise<{ prdKey: string; sourcePath: string } | null> {
+	const prds = listPRDsSorted(found.state);
+	if (prds.length === 0) return null;
+	if (prds.length === 1) {
+		return { prdKey: prds[0].key, sourcePath: prds[0].prd.sourcePath };
+	}
+
+	// Multiple PRDs — show selection sorted by most recent first
+	const options = prds.map((entry) => {
+		const tasks = entry.prd.tasks;
+		const total = Object.keys(tasks).length;
+		const completed = Object.values(tasks).filter(
+			(t) => t.status === "completed",
+		).length;
+		const failed = Object.values(tasks).filter(
+			(t) => t.status === "failed",
+		).length;
+		const relPath = path.relative(process.cwd(), entry.prd.sourcePath);
+		const updated = new Date(entry.prd.lastUpdatedAt).toLocaleString();
+		return `${relPath} — ${completed}/${total} done${failed ? `, ${failed} failed` : ""} · ${updated}`;
+	});
+
+	const selected = await ctx.ui.select(
+		"Multiple loops found. Which to resume?",
+		options,
+	);
+	if (!selected) return null;
+
+	const idx = options.indexOf(selected);
+	if (idx === -1) return null;
+	return {
+		prdKey: prds[idx].key,
+		sourcePath: prds[idx].prd.sourcePath,
+	};
+}
+
 /** Run all batches in a plan, updating the task file after each batch. */
 async function executePlanBatches(
 	plan: ReturnType<typeof buildPlanByMode>,
@@ -147,8 +239,20 @@ async function executePlanBatches(
 	// Track failed task IDs across batches to block downstream tasks
 	const failedTaskIds = new Set(progress.getFailedTaskIds());
 
+	// Loop-level execution timeout: stop starting new batches once elapsed.
+	// In-progress tasks finish naturally; we just skip remaining batches.
+	const loopStart = Date.now();
+	const loopTimeoutMs = config.execution.loopTimeoutMs;
+	let loopTimedOut = false;
+
 	try {
 		for (const batch of plan.batches) {
+			// Check loop timeout before starting a new batch
+			if (loopTimeoutMs > 0 && Date.now() - loopStart > loopTimeoutMs) {
+				loopTimedOut = true;
+				break;
+			}
+
 			if (progress.getState().paused) {
 				ctx.ui.notify(
 					"Execution paused. Use /ralpi resume to continue.",
@@ -222,6 +326,13 @@ async function executePlanBatches(
 	} finally {
 		if (projectDir) {
 			deleteLoopActive(projectDir);
+		}
+		if (loopTimedOut) {
+			const elapsed = formatDuration(Date.now() - loopStart);
+			ctx.ui.notify(
+				`Loop execution timeout reached (${elapsed}). Remaining tasks skipped. Use /ralpi resume to continue.`,
+				"warning",
+			);
 		}
 	}
 }
@@ -784,6 +895,9 @@ async function handleRun(
 
 	const completed = buildCompletedSet(progress, project);
 	const mode = await selectExecutionMode(ctx, project, taskFile, config);
+	const { autoCommit, autoReview } = await selectLoopOptions(ctx, config);
+	config.execution.autoCommit = autoCommit;
+	config.execution.autoReview = autoReview;
 	const plan = buildPlanByMode(mode, project, completed);
 
 	// Show dependency chain + execution plan before starting
@@ -839,11 +953,11 @@ async function handleResume(
 ): Promise<void> {
 	let taskFile: string;
 	let projectDir: string;
-	let found: ReturnType<typeof findProgressFile>;
+	let prdKey: string | undefined;
 
 	if (args[0]) {
 		taskFile = resolveTaskArg(args[0], process.cwd());
-		found = findProgressFile(process.cwd(), taskFile);
+		const found = findProgressFile(process.cwd(), taskFile);
 		if (!found) {
 			ctx.ui.notify(
 				`No existing progress for ${args[0]}. Start with /ralpi run ${args[0]}`,
@@ -852,8 +966,9 @@ async function handleResume(
 			return;
 		}
 		projectDir = path.dirname(path.dirname(found.path));
+		prdKey = found.prdKey;
 	} else {
-		found = findProgressFile(process.cwd());
+		const found = findProgressFile(process.cwd());
 		if (!found) {
 			ctx.ui.notify(
 				"No .ralpi/progress.json found. Start with /ralpi run [task-file]",
@@ -862,10 +977,16 @@ async function handleResume(
 			return;
 		}
 		projectDir = path.dirname(path.dirname(found.path));
-		// For no-arg resume, use the first PRD's source path or legacy sourcePath
-		taskFile = found.state.prds
-			? Object.values(found.state.prds)[0].sourcePath
-			: found.state.sourcePath;
+
+		// When no specific task file is given, let the user select which loop
+		// to resume from multiple PRDs (sorted by most recent first).
+		const selected = await selectPRDToResume(ctx, found);
+		if (!selected) {
+			ctx.ui.notify("Resume cancelled.", "info");
+			return;
+		}
+		taskFile = selected.sourcePath;
+		prdKey = selected.prdKey;
 	}
 
 	const project = parseTaskFile(taskFile);
@@ -877,21 +998,21 @@ async function handleResume(
 	const config = loadConfig(projectDir);
 	config.model = parentModel ?? ctx.model;
 	config.thinkingLevel = parentThinkingLevel;
-	const progress = new ProgressTracker(projectDir, taskFile, found.prdKey);
+	const progress = new ProgressTracker(projectDir, taskFile, prdKey);
 
 	progress.setPaused(false);
 
 	const completed = buildCompletedSet(progress, project);
 	const mode = await selectExecutionMode(ctx, project, taskFile, config);
+	const { autoCommit, autoReview } = await selectLoopOptions(ctx, config);
+	config.execution.autoCommit = autoCommit;
+	config.execution.autoReview = autoReview;
 	const plan = buildPlanByMode(mode, project, completed);
 
 	// Print remaining batches before executing
 	const formattedPlan = formatExecutionPlan(plan);
 	if (mode === "parallel") {
-		ctx.ui.notify(
-			`${formattedPlan}\n\nResuming parallel execution...`,
-			"info",
-		);
+		ctx.ui.notify(`${formattedPlan}\n\nResuming parallel execution...`, "info");
 	} else {
 		ctx.ui.notify(
 			`${formattedPlan}\n\nResuming sequential execution...`,
@@ -941,12 +1062,11 @@ async function handleReset(
 			return;
 		}
 		const projectDir = path.dirname(path.dirname(found.path));
-		const progress = new ProgressTracker(
-			projectDir,
-			found.state.prds
-				? Object.values(found.state.prds)[0].sourcePath
-				: found.state.sourcePath,
-		);
+		// Use the most recently updated PRD (first in sorted order)
+		const prds = listPRDsSorted(found.state);
+		const sourcePath =
+			prds.length > 0 ? prds[0].prd.sourcePath : found.state.sourcePath;
+		const progress = new ProgressTracker(projectDir, sourcePath);
 		progress.reset();
 	}
 

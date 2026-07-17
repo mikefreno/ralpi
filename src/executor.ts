@@ -4,7 +4,7 @@ import type { Task, Project, Reflection, ToolUsage } from "./types";
 import type { RalpiConfig } from "./types";
 import type { ProgressTracker } from "./progress";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { buildTaskPrompt } from "./prompts";
+import { buildTaskPrompt, buildReviewPrompt, MAX_DIFF_BYTES } from "./prompts";
 import { extractReflection } from "./reflection";
 import {
 	runAgentSession,
@@ -14,6 +14,8 @@ import {
 	hasUncommittedChanges,
 	getGitStatusPorcelain,
 	getGitDiff,
+	getLatestCommitDiff,
+	resolveModelSpec,
 	formatDuration,
 } from "./utils";
 import { updateTaskInFile } from "./parser";
@@ -72,6 +74,11 @@ class ModelRoundRobin {
 
 	get length(): number {
 		return this.models.length;
+	}
+
+	/** All resolved models in the pool (for follow-up session failover). */
+	get allModels(): unknown[] {
+		return this.models;
 	}
 
 	assign(taskId: string): unknown {
@@ -627,14 +634,19 @@ async function executeTask(
 	roundRobin?: ModelRoundRobin | null,
 	batchRender?: () => void,
 ): Promise<void> {
-	const maxRetries = config.execution.maxRetries;
-
 	// Model failover: when a provider/API is down, cycle through available models.
-	// result.success === false always means an agent-session failure (API error,
-	// provider unreachable, etc.), not a task-work error.
+	// Pi's built-in retry (via SettingsManager) handles transient errors with
+	// exponential backoff within each model. Ralpi only handles model cycling.
 	const maxModelAttempts = roundRobin ? roundRobin.length : 1;
 	let modelAttempt = 0;
-	let currentModel: unknown = assignedModel ?? config.model;
+	// Resolve implModel from config (used in sequential mode when no round-robin assignment).
+	// In parallel mode, the round-robin assignedModel takes precedence.
+	const implModel = resolveModelSpec(
+		ctx.modelRegistry as { find(p: string, m: string): unknown } | undefined,
+		config.execution.implModel,
+		(msg) => ctx.ui.notify(msg, "warning"),
+	);
+	let currentModel: unknown = assignedModel ?? implModel ?? config.model;
 
 	while (modelAttempt < maxModelAttempts) {
 		// On subsequent model attempts, advance to the next model.
@@ -644,46 +656,53 @@ async function executeTask(
 			currentModel = roundRobin.advance(task.id);
 		}
 
-		let retries = 0;
-		while (retries <= maxRetries) {
+		try {
+			// Mark as in progress
+			progress.markInProgress(task.id);
+			// Auto-update the PRD source file checkbox
 			try {
-				// Mark as in progress
-				progress.markInProgress(task.id);
-				// Auto-update the PRD source file checkbox
-				try {
-					updateTaskInFile(project.sourcePath, task.id, "in_progress");
-				} catch {
-					// Best-effort: don't fail the task over a checkbox update
-				}
+				updateTaskInFile(project.sourcePath, task.id, "in_progress");
+			} catch {
+				// Best-effort: don't fail the task over a checkbox update
+			}
 
-				// Get dependency reflections
-				const depReflections = progress.getDependencyReflections(
-					task.dependencies || [],
-				);
+			// Get dependency reflections
+			const depReflections = progress.getDependencyReflections(
+				task.dependencies || [],
+			);
 
-				// Run the task
-				const result = await runTask(
-					task,
-					project,
-					config,
-					depReflections,
-					ctx,
-					sendChatMessage,
-					projectDir,
-					parallelState,
-					currentModel,
-					batchRender,
-				);
+			// Run the task
+			const result = await runTask(
+				task,
+				project,
+				config,
+				depReflections,
+				ctx,
+				sendChatMessage,
+				projectDir,
+				parallelState,
+				currentModel,
+				batchRender,
+			);
 
-				if (result.success) {
-					// ── Auto-Commit: Trigger follow-up agent session for uncommitted changes ──
-					let finalCommitMessages = result.commitMessages ?? [];
-					let finalCommitSummary = result.commitSummary ?? "";
+			if (result.success) {
+				// ── Auto-Commit: optionally trigger follow-up agent session for uncommitted changes ──
+				let finalCommitMessages = result.commitMessages ?? [];
+				let finalCommitSummary = result.commitSummary ?? "";
 
+				if (config.execution.autoCommit) {
 					try {
 						if (hasUncommittedChanges(projectDir)) {
 							const status = getGitStatusPorcelain(projectDir);
-							const diff = getGitDiff(projectDir);
+							let diff = getGitDiff(projectDir);
+							let diffNote = "";
+							if (diff.length > MAX_DIFF_BYTES) {
+								diffNote =
+									"\n\n... (diff truncated: omitted " +
+									(diff.length - MAX_DIFF_BYTES).toLocaleString() +
+									" bytes; run `git diff` to view the full diff)";
+								diff = diff.slice(0, MAX_DIFF_BYTES);
+							}
 							const commitPrompt = [
 								`## Auto-Commit for Task ${task.id}: ${task.title}`,
 								"",
@@ -703,118 +722,34 @@ async function executeTask(
 								"### Current Tracked Diff (git diff)",
 								"```diff",
 								diff || "(no tracked diff output)",
+								diffNote,
 								"```",
 							].join("\n");
 
-							// ── Commit widget setup ──
-							const commitWidgetKey = `ralpi-commit-${task.id}`;
-							let commitFrameIndex = 0;
-							const commitToolCalls: ToolCallEntry[] = [];
-							let commitWidgetTui: { requestRender(): void } | null = null;
+							// Resolve commit model (fall back to current task model)
+							const commitModel =
+								resolveModelSpec(
+									ctx.modelRegistry as
+										| { find(p: string, m: string): unknown }
+										| undefined,
+									config.execution.commitModel,
+									(msg) => ctx.ui.notify(msg, "warning"),
+								) ?? currentModel;
 
-							const commitHeader = `commit for ${task.id} · ${task.title}`;
+							// Build failover list: primary model first, then the rest of the pool.
+							const commitModels = buildFailoverModels(commitModel, roundRobin);
 
-							const buildCommitLines = (
-								t: typeof ctx.ui.theme,
-								width?: number,
-							): string[] => {
-								const effectiveWidth = width || 74;
-								const frame = t.fg(
-									"accent",
-									SPINNER_FRAMES[commitFrameIndex % SPINNER_FRAMES.length],
-								);
-								const lines = [
-									truncateToWidth(`~ ${frame} ${commitHeader}`, effectiveWidth),
-								];
-
-								if (commitToolCalls.length > 0) {
-									if (commitToolCalls.length <= MAX_COLLAPSED) {
-										for (let i = 0; i < commitToolCalls.length; i++) {
-											const entry = commitToolCalls[i];
-											const isLast = i === commitToolCalls.length - 1;
-											const branch = isLast ? "  └── " : "  ├── ";
-											const tag = t.fg("accent", `[${entry.name}]`);
-											lines.push(
-												truncateToWidth(
-													`${branch}${tag} ${entry.label}`,
-													effectiveWidth,
-												),
-											);
-										}
-									} else {
-										const shown = commitToolCalls.slice(-MAX_COLLAPSED);
-										const remaining = commitToolCalls.length - shown.length;
-										lines.push(
-											truncateToWidth(
-												t.fg("dim", `  ├── …${remaining} earlier`),
-												effectiveWidth,
-											),
-										);
-										for (let i = 0; i < shown.length; i++) {
-											const entry = shown[i];
-											const isLast = i === shown.length - 1;
-											const branch = isLast ? "  └── " : "  ├── ";
-											const tag = t.fg("accent", `[${entry.name}]`);
-											lines.push(
-												truncateToWidth(
-													`${branch}${tag} ${entry.label}`,
-													effectiveWidth,
-												),
-											);
-										}
-									}
-								}
-								return lines;
-							};
-
-							ctx.ui.setWidget(commitWidgetKey, (tui, t) => {
-								commitWidgetTui = tui;
-								return {
-									render: (width?: number) => buildCommitLines(t, width),
-									invalidate: () => commitWidgetTui?.requestRender(),
-								};
-							});
-
-							const requestCommitRender = () =>
-								commitWidgetTui?.requestRender();
-
-							const commitSpinnerTimer = setInterval(() => {
-								commitFrameIndex =
-									(commitFrameIndex + 1) % SPINNER_FRAMES.length;
-								requestCommitRender();
-							}, 100);
-
-							// Use a short timeout for the commit session (60s should be enough)
-							const commitTimeout = Math.min(
-								60_000,
-								config.execution.timeoutMs,
-							);
-
-							let commitResult: Awaited<ReturnType<typeof runAgentSession>>;
-
-							try {
-								commitResult = await runAgentSession(
+							const { result: commitResult, toolCalls: commitToolCalls } =
+								await runFollowUpSession(
+									ctx,
+									config,
 									commitPrompt,
 									projectDir,
-									commitTimeout,
-									(event) => {
-										if (event.type === "tool_execution_start") {
-											const label = formatToolArg(event.toolName, event.args);
-											commitToolCalls.push({
-												name: event.toolName,
-												label,
-											});
-											requestCommitRender();
-										}
-									},
-									undefined,
-									currentModel,
-									config.thinkingLevel,
+									`commit for ${task.id} · ${task.title}`,
+									`commit-${task.id}`,
+									config.execution.commitTimeoutMs,
+									commitModels,
 								);
-							} finally {
-								clearInterval(commitSpinnerTimer);
-								ctx.ui.setWidget(commitWidgetKey, undefined);
-							}
 
 							if (commitResult.success) {
 								// Re-capture commits made during this follow-up session
@@ -846,94 +781,152 @@ async function executeTask(
 							}`,
 						);
 					}
+				}
 
-					// Save reflection
-					if (result.reflection) {
-						saveReflectionToFile(projectDir, config, result.reflection);
-					}
-
-					// Mark completed with all metadata
-					progress.markCompleted(
-						task.id,
-						result.durationMs,
-						result.reflection,
-						result.toolUsage,
-						result.outputPreview,
-						finalCommitMessages,
-						finalCommitSummary,
-					);
-					// Auto-update the PRD source file checkbox
+				// ── Auto-Review: optionally spawn a review agent to review the latest commit ──
+				if (config.execution.autoReview) {
 					try {
-						updateTaskInFile(project.sourcePath, task.id, "completed");
-					} catch {
-						// Best-effort: don't fail the task over a checkbox update
+						const commitInfo = getLatestCommitDiff(projectDir);
+						if (commitInfo && commitInfo.diff) {
+							const reviewPrompt = buildReviewPrompt(
+								task,
+								project,
+								commitInfo.hash,
+								commitInfo.subject,
+								commitInfo.diff,
+								config.prompts.projectContext,
+							);
+
+							// Resolve review model (fall back to current task model)
+							const reviewModel =
+								resolveModelSpec(
+									ctx.modelRegistry as
+										| { find(p: string, m: string): unknown }
+										| undefined,
+									config.execution.reviewModel,
+									(msg) => ctx.ui.notify(msg, "warning"),
+								) ?? currentModel;
+
+							// Build failover list: primary model first, then the rest of the pool.
+							const reviewModels = buildFailoverModels(reviewModel, roundRobin);
+
+							const { result: reviewResult, toolCalls: reviewToolCalls } =
+								await runFollowUpSession(
+									ctx,
+									config,
+									reviewPrompt,
+									projectDir,
+									`review for ${task.id} · ${task.title}`,
+									`review-${task.id}`,
+									config.execution.reviewTimeoutMs,
+									reviewModels,
+								);
+
+							if (reviewResult.success) {
+								const reviewText = reviewResult.text.trim();
+								// Post review as a chat message with tool calls
+								const preview =
+									reviewText.length > 500
+										? reviewText.slice(0, 500) + "\n... (truncated)"
+										: reviewText;
+								sendChatMessage?.(
+									`⚑ review for ${task.id} · ${task.title}\n${preview}`,
+									{ toolCalls: reviewToolCalls },
+								);
+							} else {
+								sendChatMessage?.(
+									`~ review for ${task.id} · ${task.title} — review session failed: ${reviewResult.error}`,
+									{ toolCalls: reviewToolCalls },
+								);
+							}
+						}
+					} catch (error) {
+						// Don't fail the task if auto-review fails
+						sendChatMessage?.(
+							`~ review for ${task.id} · ${task.title} — auto-review error: ${
+								error instanceof Error ? error.message : String(error)
+							}`,
+						);
 					}
-					roundRobin?.release(task.id);
-					return;
 				}
 
-				// Agent session failed (provider error).
-				// If we have more models, cycle immediately — don't waste retries.
-				if (roundRobin && modelAttempt < maxModelAttempts - 1) {
-					// Don't release — advance() already handles the transition.
-					// release() would put the slot in freeSlots, then assign()
-					// would pick it right back up, getting stuck on the same model.
-					modelAttempt++;
-					sendChatMessage?.(
-						`~ ${task.id} · ${task.title} — trying model ${modelAttempt + 1}/${maxModelAttempts} (previous: ${result.error})`,
+				// Save reflection
+				if (result.reflection) {
+					saveReflectionToFile(
+						projectDir,
+						config,
+						result.reflection,
+						progress.getKey(),
 					);
-					break; // exit retry loop, cycle to next model
 				}
 
-				// No more models — use normal retry logic
-				if (retries < maxRetries) {
-					retries = progress.incrementRetry(task.id);
-					sendChatMessage?.(
-						`~ ${task.id} · ${task.title} — retrying (${retries}/${maxRetries}): ${result.error}`,
-					);
-
-					// Exponential backoff
-					const delay = config.execution.retryDelayMs * 2 ** (retries - 1);
-					await sleep(delay);
-				} else {
-					// Max retries exceeded
-					progress.markFailed(task.id, result.error || "Unknown error");
-					// Don't update PRD — retry exhaustion is transient, not terminal
-					sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${result.error}`);
-					ctx.ui.notify(
-						`Task ${task.id} failed after ${maxRetries} retries: ${
-							result.error || "Unknown error"
-						}`,
-						"error",
-					);
-					return;
-				}
-			} catch (error) {
-				roundRobin?.release(task.id);
-				batchRender?.();
-				const errorMsg = error instanceof Error ? error.message : String(error);
-				progress.markFailed(task.id, errorMsg);
+				// Mark completed with all metadata
+				progress.markCompleted(
+					task.id,
+					result.durationMs,
+					result.reflection,
+					result.toolUsage,
+					result.outputPreview,
+					finalCommitMessages,
+					finalCommitSummary,
+				);
 				// Auto-update the PRD source file checkbox
 				try {
-					updateTaskInFile(project.sourcePath, task.id, "failed");
+					updateTaskInFile(project.sourcePath, task.id, "completed");
 				} catch {
-					// Best-effort
+					// Best-effort: don't fail the task over a checkbox update
 				}
-				sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${errorMsg}`);
-				ctx.ui.notify(`Task ${task.id} failed: ${errorMsg}`, "error");
+				roundRobin?.release(task.id);
 				return;
 			}
-		}
 
-		// If we broke out (model cycling), continue the outer loop
-		modelAttempt++;
+			// Agent session failed (provider error).
+			// Pi's built-in retry already exhausted for this model. Cycle to the next.
+			if (roundRobin && modelAttempt < maxModelAttempts - 1) {
+				modelAttempt++;
+				sendChatMessage?.(
+					`~ ${task.id} · ${task.title} — cycling to model ${modelAttempt + 1}/${maxModelAttempts} (previous: ${result.error})`,
+				);
+				continue; // next model in the outer while loop
+			}
+
+			// All models exhausted.
+			progress.markFailed(task.id, result.error || "Unknown error");
+			try {
+				updateTaskInFile(project.sourcePath, task.id, "failed");
+			} catch {
+				// Best-effort
+			}
+			sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${result.error}`);
+			ctx.ui.notify(
+				`Task ${task.id} failed across ${maxModelAttempts} models: ${
+					result.error || "Unknown error"
+				}`,
+				"error",
+			);
+			roundRobin?.release(task.id);
+			return;
+		} catch (error) {
+			roundRobin?.release(task.id);
+			batchRender?.();
+			const errorMsg = error instanceof Error ? error.message : String(error);
+			progress.markFailed(task.id, errorMsg);
+			// Auto-update the PRD source file checkbox
+			try {
+				updateTaskInFile(project.sourcePath, task.id, "failed");
+			} catch {
+				// Best-effort
+			}
+			sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${errorMsg}`);
+			ctx.ui.notify(`Task ${task.id} failed: ${errorMsg}`, "error");
+			return;
+		}
 	}
 
 	// All models exhausted — release the slot
 	roundRobin?.release(task.id);
 	batchRender?.();
 	progress.markFailed(task.id, "All configured models exhausted");
-	// Don't update PRD — model exhaustion is transient, not terminal
 	sendChatMessage?.(
 		`✗ ${task.id} · ${task.title} — all ${maxModelAttempts} models exhausted`,
 	);
@@ -949,17 +942,167 @@ function saveReflectionToFile(
 	sourceDir: string,
 	config: RalpiConfig,
 	reflection: Reflection,
+	prdKey: string,
 ): void {
-	const reflectionsDir = path.join(sourceDir, config.paths.reflectionsDir);
+	const reflectionsDir = path.join(
+		sourceDir,
+		config.paths.reflectionsDir,
+		prdKey,
+	);
 	ensureDir(reflectionsDir);
 	const filePath = path.join(reflectionsDir, `${reflection.taskId}.json`);
 	writeFileSafe(filePath, JSON.stringify(reflection, null, 2));
 }
 
+// ─── Follow-Up Sessions (Commit / Review) ─────────────────────────────────────
+
+/**
+ * Run a follow-up agent session (commit, review, etc.) with a live spinner
+ * widget. Handles widget setup, spinner animation, session execution, and
+ * cleanup. Cycles through `models` on connection failure so a flaky provider
+ * doesn't kill the commit/review step. Returns the session result and
+ * captured tool calls.
+ */
+async function runFollowUpSession(
+	ctx: ExtensionContext,
+	config: RalpiConfig,
+	prompt: string,
+	projectDir: string,
+	header: string,
+	widgetKeySuffix: string,
+	timeoutMs: number,
+	models: unknown[],
+): Promise<{
+	result: Awaited<ReturnType<typeof runAgentSession>>;
+	toolCalls: ToolCallEntry[];
+}> {
+	const toolCalls: ToolCallEntry[] = [];
+	let frameIndex = 0;
+	let widgetTui: { requestRender(): void } | null = null;
+	const widgetKey = `ralpi-${widgetKeySuffix}-${Date.now()}`;
+
+	const truncateWidth = 74;
+
+	const buildLines = (t: typeof ctx.ui.theme, width?: number): string[] => {
+		const effectiveWidth = width
+			? Math.min(width, truncateWidth)
+			: truncateWidth;
+		const frame = t.fg(
+			"accent",
+			SPINNER_FRAMES[frameIndex % SPINNER_FRAMES.length],
+		);
+		const lines = [truncateToWidth(`~ ${frame} ${header}`, effectiveWidth)];
+
+		if (toolCalls.length > 0) {
+			if (toolCalls.length <= MAX_COLLAPSED) {
+				for (let i = 0; i < toolCalls.length; i++) {
+					const entry = toolCalls[i];
+					const isLast = i === toolCalls.length - 1;
+					const branch = isLast ? "  └── " : "  ├── ";
+					const tag = t.fg("accent", `[${entry.name}]`);
+					lines.push(
+						truncateToWidth(`${branch}${tag} ${entry.label}`, effectiveWidth),
+					);
+				}
+			} else {
+				const shown = toolCalls.slice(-MAX_COLLAPSED);
+				const remaining = toolCalls.length - shown.length;
+				lines.push(
+					truncateToWidth(
+						t.fg("dim", `  ├── …${remaining} earlier`),
+						effectiveWidth,
+					),
+				);
+				for (let i = 0; i < shown.length; i++) {
+					const entry = shown[i];
+					const isLast = i === shown.length - 1;
+					const branch = isLast ? "  └── " : "  ├── ";
+					const tag = t.fg("accent", `[${entry.name}]`);
+					lines.push(
+						truncateToWidth(`${branch}${tag} ${entry.label}`, effectiveWidth),
+					);
+				}
+			}
+		}
+		return lines;
+	};
+
+	ctx.ui.setWidget(widgetKey, (tui, t) => {
+		widgetTui = tui;
+		return {
+			render: (width?: number) => buildLines(t, width),
+			invalidate: () => widgetTui?.requestRender(),
+		};
+	});
+
+	const requestRender = () => widgetTui?.requestRender();
+
+	const spinnerTimer = setInterval(() => {
+		frameIndex = (frameIndex + 1) % SPINNER_FRAMES.length;
+		requestRender();
+	}, 100);
+
+	let result: Awaited<ReturnType<typeof runAgentSession>> | undefined;
+	try {
+		for (let attempt = 0; attempt < models.length; attempt++) {
+			const model = models[attempt];
+			result = await runAgentSession(
+				prompt,
+				projectDir,
+				timeoutMs,
+				(event) => {
+					if (event.type === "tool_execution_start") {
+						const label = formatToolArg(event.toolName, event.args);
+						toolCalls.push({ name: event.toolName, label });
+						requestRender();
+					}
+				},
+				undefined,
+				model,
+				config.thinkingLevel,
+				true, // noSkills — follow-up sessions don't need the skills catalog
+			);
+
+			if (result.success) break;
+
+			// If there's a next model to try, cycle; otherwise give up.
+			if (attempt < models.length - 1) {
+				// Clear partial tool calls from the failed attempt so the widget
+				// reflects only the successful (or final) attempt.
+				toolCalls.length = 0;
+				requestRender();
+			}
+		}
+	} finally {
+		clearInterval(spinnerTimer);
+		ctx.ui.setWidget(widgetKey, undefined);
+	}
+
+	// result is always set — the loop runs at least once (models.length >= 1)
+	return { result: result!, toolCalls };
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Build a model failover list for a follow-up session.
+ *
+ * The primary model goes first; the remaining models from the round-robin
+ * pool are appended (deduped) so a flaky provider doesn't kill the commit
+ * or review step. When there's no round-robin (sequential mode), the
+ * primary model is returned as a single-element list.
+ */
+function buildFailoverModels(
+	primary: unknown,
+	roundRobin: ModelRoundRobin | null | undefined,
+): unknown[] {
+	const models: unknown[] = [primary];
+	if (roundRobin) {
+		for (const m of roundRobin.allModels) {
+			if (m !== primary) models.push(m);
+		}
+	}
+	return models;
 }
 
 // ─── Tool Call Formatting ────────────────────────────────────────────────

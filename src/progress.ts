@@ -237,15 +237,6 @@ export class ProgressTracker {
 			.filter((r): r is Reflection => r !== undefined);
 	}
 
-	/** Increment retry count */
-	incrementRetry(taskId: string): number {
-		const prd = this.getPRD();
-		this.ensureTask(prd, taskId);
-		prd.tasks[taskId].retries++;
-		this.save();
-		return prd.tasks[taskId].retries;
-	}
-
 	/** Set paused state */
 	setPaused(paused: boolean): void {
 		const prd = this.getPRD();
@@ -277,7 +268,7 @@ export class ProgressTracker {
 
 	private ensureTask(prd: PRDProgress, taskId: string): void {
 		if (!prd.tasks[taskId]) {
-			prd.tasks[taskId] = { status: "pending", retries: 0 };
+			prd.tasks[taskId] = { status: "pending" };
 		}
 	}
 }
