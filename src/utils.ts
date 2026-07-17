@@ -14,6 +14,7 @@ import {
 	getAgentDir,
 	SessionManager,
 	SettingsManager,
+	type ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
 
 // ─── Directory Helpers ───────────────────────────────────────────────────────
@@ -512,6 +513,11 @@ export async function runAgentSession(
 	 *  focused follow-up sessions (commit/review) that don't need skills —
 	 *  keeps the context lean and avoids dragging in unrelated overhead. */
 	noSkills = false,
+	/** Parent session's model runtime. Must be passed so extension-registered
+	 *  providers (e.g., neuralwatt with its streamSimple wrapper for 429
+	 *  rate-limit normalization) are available. When omitted, the SDK creates
+	 *  a fresh runtime from models.json only — extension providers are lost. */
+	modelRuntime?: ModelRuntime,
 ): Promise<{
 	success: boolean;
 	text: string;
@@ -556,6 +562,7 @@ export async function runAgentSession(
 			sessionManager: SessionManager.inMemory(),
 			resourceLoader: loader,
 			settingsManager: SettingsManager.create(cwd, getAgentDir()),
+			modelRuntime,
 			tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
 			model: model as any,
 			thinkingLevel: thinkingLevel as any,

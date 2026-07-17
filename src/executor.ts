@@ -3,7 +3,10 @@ import * as path from "node:path";
 import type { Task, Project, Reflection, ToolUsage } from "./types";
 import type { RalpiConfig } from "./types";
 import type { ProgressTracker } from "./progress";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionContext,
+	ModelRuntime,
+} from "@earendil-works/pi-coding-agent";
 import { buildTaskPrompt, buildReviewPrompt, MAX_DIFF_BYTES } from "./prompts";
 import { extractReflection } from "./reflection";
 import {
@@ -291,6 +294,8 @@ export async function runTask(
 		undefined, // no abort signal
 		assignedModel ?? config.model,
 		config.thinkingLevel,
+		false, // noSkills — task sessions need skills
+		(ctx.modelRegistry as any).runtime as ModelRuntime,
 	);
 
 	const durationMs = Date.now() - startMs;
@@ -713,6 +718,7 @@ async function executeTask(
 								"",
 								"Stage only the files relevant to this task with `git add <files>`, then create a meaningful git commit.",
 								"Use a descriptive commit message and follow conventional commits format.",
+								"Do NOT include the task number, task ID, or any ralpi task reference in the commit message. The commit message must describe only the work done — never mention the task ID (e.g. `task 03`, `#3`, etc.).",
 								"",
 								"### Current Changes (git status --porcelain)",
 								"```text",
@@ -1061,6 +1067,7 @@ async function runFollowUpSession(
 				model,
 				config.thinkingLevel,
 				true, // noSkills — follow-up sessions don't need the skills catalog
+				(ctx.modelRegistry as any).runtime as ModelRuntime,
 			);
 
 			if (result.success) break;
