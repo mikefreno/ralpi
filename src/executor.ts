@@ -27,7 +27,14 @@ import { updateTaskInFile } from "./parser";
 export type SendChatMessage = (
 	content: string,
 	/** Extra data passed to the message renderer for the expanded view. */
-	meta?: { toolCalls?: ToolCallEntry[] },
+	meta?: {
+		toolCalls?: ToolCallEntry[];
+		/** Full review body for review messages — renderer shows it in the
+		 *  expanded (Ctrl+O) view so long reviews aren't lost to truncation. */
+		reviewText?: string;
+		/** Saved file path when the review has been persisted to disk. */
+		reviewPath?: string;
+	},
 ) => void;
 
 export interface ToolCallEntry {
@@ -830,14 +837,34 @@ async function executeTask(
 
 							if (reviewResult.success) {
 								const reviewText = reviewResult.text.trim();
-								// Post review as a chat message with tool calls
-								const preview =
-									reviewText.length > 500
-										? reviewText.slice(0, 500) + "\n... (truncated)"
-										: reviewText;
+
+								// Persist the full review to disk when opted in at loop
+								// start. Mirrors the reflections layout so a repo can
+								// hold many loops without collisions:
+								//   .ralpi/reviews/<prdKey>/<taskId>.md
+								let reviewPath: string | undefined;
+								if (config.execution.saveReviews) {
+									reviewPath = saveReviewToFile(
+										projectDir,
+										config,
+										task.id,
+										reviewText,
+										progress.getKey(),
+									);
+								}
+
+								// Post review as a chat message. The full body is
+								// passed via meta.reviewText so the expanded (Ctrl+O)
+								// view can render it without truncation; the collapsed
+								// content shows a short tail + a hint to expand.
+								const lines = reviewText.split("\n").filter((l) => l.trim());
+								const tail = lines.slice(-3).join("\n");
+								const savedHint = reviewPath
+									? ` \u00b7 saved to ${reviewPath}`
+									: "";
 								sendChatMessage?.(
-									`⚑ review for ${task.id} · ${task.title}\n${preview}`,
-									{ toolCalls: reviewToolCalls },
+									`⚑ review for ${task.id} · ${task.title}${savedHint}\n${tail}`,
+									{ toolCalls: reviewToolCalls, reviewText, reviewPath },
 								);
 							} else {
 								sendChatMessage?.(
@@ -958,6 +985,24 @@ function saveReflectionToFile(
 	ensureDir(reflectionsDir);
 	const filePath = path.join(reflectionsDir, `${reflection.taskId}.json`);
 	writeFileSafe(filePath, JSON.stringify(reflection, null, 2));
+}
+
+// ─── Save Review Output to File ─────────────────────────────────────────────
+// Mirrors saveReflectionToFile's per-loop layout so a repo can hold many
+// loops without collisions: .ralpi/reviews/<prdKey>/<taskId>.md
+
+function saveReviewToFile(
+	sourceDir: string,
+	config: RalpiConfig,
+	taskId: string,
+	reviewText: string,
+	prdKey: string,
+): string {
+	const reviewsDir = path.join(sourceDir, config.paths.reviewsDir, prdKey);
+	ensureDir(reviewsDir);
+	const filePath = path.join(reviewsDir, `${taskId}.md`);
+	writeFileSafe(filePath, reviewText);
+	return filePath;
 }
 
 // ─── Follow-Up Sessions (Commit / Review) ─────────────────────────────────────

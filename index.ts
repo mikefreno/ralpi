@@ -131,7 +131,7 @@ function buildPlanByMode(
 async function selectLoopOptions(
 	ctx: ExtensionContext,
 	config: import("./src/types").RalpiConfig,
-): Promise<{ autoCommit: boolean; autoReview: boolean }> {
+): Promise<{ autoCommit: boolean; autoReview: boolean; saveReviews: boolean }> {
 	const explicit = config.execution.explicitKeys;
 
 	// Skip the commit prompt when the YAML explicitly sets it.
@@ -149,6 +149,7 @@ async function selectLoopOptions(
 	}
 
 	let autoReview = false;
+	let saveReviews = false;
 	if (autoCommit) {
 		// Skip the review prompt when the YAML explicitly sets it.
 		if (explicit?.has("autoReview")) {
@@ -162,9 +163,27 @@ async function selectLoopOptions(
 				? reviewChoice.startsWith("Yes")
 				: config.execution.autoReview;
 		}
+
+		// Only ask to persist reviews when reviews are actually enabled.
+		if (autoReview) {
+			if (explicit?.has("saveReviews")) {
+				saveReviews = config.execution.saveReviews;
+			} else {
+				const saveChoice = await ctx.ui.select(
+					"Save full review output to disk?",
+					[
+						"Yes — write each review to .ralpi/reviews/<loop>/<task>.md",
+						"No — keep reviews in-chat only",
+					],
+				);
+				saveReviews = saveChoice
+					? saveChoice.startsWith("Yes")
+					: config.execution.saveReviews;
+			}
+		}
 	}
 
-	return { autoCommit, autoReview };
+	return { autoCommit, autoReview, saveReviews };
 }
 
 /**
@@ -350,6 +369,8 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 				| {
 						phase?: string;
 						toolCalls?: Array<{ name: string; label: string }>;
+						reviewText?: string;
+						reviewPath?: string;
 				  }
 				| undefined;
 
@@ -358,6 +379,23 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 
 			// Header line — e.g. "✓ 05 · billing-subscriptions-trials (2m 14s)"
 			lines.push(String(message.content));
+
+			// Review body: in expanded mode render the full review text so long
+			// reviews aren't lost to the 500-char preview. In collapsed mode
+			// show a dim hint that the review is available via Ctrl+O (the
+			// header already carries a short tail + saved-path hint).
+			const hasReview = !!details?.reviewText;
+			if (hasReview && expanded && details!.reviewText) {
+				const body = details!.reviewText.split("\n");
+				for (const line of body) {
+					lines.push(`  ${line}`);
+				}
+			} else if (hasReview && !expanded) {
+				const hint = details?.reviewPath
+					? `press Ctrl+O for full review · saved to ${details.reviewPath}`
+					: "press Ctrl+O for full review";
+				lines.push(theme.fg("dim", `  ├── ${hint}`));
+			}
 
 			// Build tool-call tree
 			if (details?.toolCalls && details.toolCalls.length > 0) {
@@ -742,16 +780,27 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 			// Wraps pi.sendMessage() for posting status to the chat history.
 			// Uses "ralpi-progress" customType with a "progress" phase so the
 			// renderer omits the label prefix entirely (no [INFO] etc.).
-			// Accepts an optional meta object with toolCalls for the expandable view.
+			// Accepts an optional meta object with toolCalls for the expandable view,
+			// and reviewText/reviewPath for review messages so the expanded
+			// (Ctrl+O) view can render the full review body without truncation.
 			const sendProgress: SendChatMessage = (
 				content: string,
-				meta?: { toolCalls?: Array<{ name: string; label: string }> },
+				meta?: {
+					toolCalls?: Array<{ name: string; label: string }>;
+					reviewText?: string;
+					reviewPath?: string;
+				},
 			) => {
 				pi.sendMessage({
 					customType: "ralpi-progress",
 					content,
 					display: true,
-					details: { phase: "progress", toolCalls: meta?.toolCalls },
+					details: {
+						phase: "progress",
+						toolCalls: meta?.toolCalls,
+						reviewText: meta?.reviewText,
+						reviewPath: meta?.reviewPath,
+					},
 				});
 			};
 
@@ -895,9 +944,13 @@ async function handleRun(
 
 	const completed = buildCompletedSet(progress, project);
 	const mode = await selectExecutionMode(ctx, project, taskFile, config);
-	const { autoCommit, autoReview } = await selectLoopOptions(ctx, config);
+	const { autoCommit, autoReview, saveReviews } = await selectLoopOptions(
+		ctx,
+		config,
+	);
 	config.execution.autoCommit = autoCommit;
 	config.execution.autoReview = autoReview;
+	config.execution.saveReviews = saveReviews;
 	const plan = buildPlanByMode(mode, project, completed);
 
 	// Show dependency chain + execution plan before starting
@@ -1004,9 +1057,13 @@ async function handleResume(
 
 	const completed = buildCompletedSet(progress, project);
 	const mode = await selectExecutionMode(ctx, project, taskFile, config);
-	const { autoCommit, autoReview } = await selectLoopOptions(ctx, config);
+	const { autoCommit, autoReview, saveReviews } = await selectLoopOptions(
+		ctx,
+		config,
+	);
 	config.execution.autoCommit = autoCommit;
 	config.execution.autoReview = autoReview;
+	config.execution.saveReviews = saveReviews;
 	const plan = buildPlanByMode(mode, project, completed);
 
 	// Print remaining batches before executing

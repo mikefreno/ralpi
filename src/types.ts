@@ -164,6 +164,8 @@ export interface RalpiConfig {
 		stateDir: string;
 		/** Directory for per-task reflections */
 		reflectionsDir: string;
+		/** Directory for per-loop review output (mirrors reflectionsDir) */
+		reviewsDir: string;
 	};
 	execution: {
 		/** Task execution timeout in milliseconds */
@@ -176,6 +178,9 @@ export interface RalpiConfig {
 		autoCommit: boolean;
 		/** Spawn a review agent to review the commit against the task description */
 		autoReview: boolean;
+		/** Persist the full review output to `.ralpi/reviews/<task-id>.md`.
+		 *  Only active when autoReview is true and the user opts in at loop start. */
+		saveReviews: boolean;
 		/** Keys under `execution:` explicitly present in a loaded config YAML.
 		 *  Used to skip interactive prompts for fields the user already set. */
 		explicitKeys?: Set<string>;
@@ -208,6 +213,7 @@ export const DEFAULT_CONFIG: RalpiConfig = {
 	paths: {
 		stateDir: ".ralpi",
 		reflectionsDir: ".ralpi/reflections",
+		reviewsDir: ".ralpi/reviews",
 	},
 	execution: {
 		timeoutMs: 0, // 0 = inherit Pi's own defaults (no ralpi-level timeout)
@@ -215,6 +221,7 @@ export const DEFAULT_CONFIG: RalpiConfig = {
 		models: [],
 		autoCommit: true,
 		autoReview: false,
+		saveReviews: false,
 		commitModel: "",
 		reviewModel: "",
 		implModel: "",
