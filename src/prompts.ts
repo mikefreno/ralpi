@@ -426,3 +426,101 @@ export function buildPlanPrompt(project: Project): string {
 
 	return lines.join("\n");
 }
+
+// ─── Conflict Resolution Prompt ─────────────────────────────────────────────
+
+/**
+ * Build the prompt for a conflict-resolution agent session.
+ *
+ * The main repo is in a merge-conflict state (from `reattemptMerge`). The
+ * agent must resolve all conflict markers in the conflicted files, stage the
+ * resolved files, and commit to complete the merge.
+ */
+export function buildConflictResolutionPrompt(
+	task: Task,
+	project: Project,
+	conflicts: string[],
+	branch: string,
+	projectContext?: string,
+): string {
+	const parts: string[] = [];
+
+	parts.push(`# Merge Conflict Resolution: Task ${task.id}: ${task.title}`);
+	parts.push("");
+	parts.push(
+		`A merge of branch \`${branch}\` into the current branch produced conflicts.`,
+	);
+	parts.push("You must resolve all conflicts and complete the merge.");
+	parts.push("");
+
+	// ── Task Context ──
+
+	parts.push("## Task Description");
+	if (task.description) {
+		parts.push(task.description);
+	} else {
+		parts.push(task.title);
+	}
+	parts.push("");
+
+	// ── Task Specification ──
+
+	if (task.file) {
+		const spec = readTaskSpec(project.sourceDir, task.file);
+		if (spec) {
+			parts.push("## Task Specification");
+			parts.push(`Full details from \`${task.file}\`:`);
+			parts.push("");
+			parts.push(spec);
+			parts.push("");
+		}
+	}
+
+	// ── Conflicted Files ──
+
+	parts.push("## Conflicted Files");
+	parts.push(
+		"The following files have unresolved merge conflicts (conflict markers `<<<<<<<`, `=======`, `>>>>>>>`):",
+	);
+	parts.push("");
+	for (const f of conflicts) {
+		parts.push(`- \`${f}\``);
+	}
+	parts.push("");
+
+	// ── Project Context ──
+
+	if (projectContext) {
+		parts.push("## Additional Context");
+		parts.push(projectContext);
+		parts.push("");
+	}
+
+	// ── Resolution Instructions ──
+
+	parts.push("## Resolution Instructions");
+	parts.push(
+		"1. Read each conflicted file to understand both sides of the conflict.",
+	);
+	parts.push(
+		"2. Edit each file to remove all conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`).",
+	);
+	parts.push(
+		"   Keep the correct changes from both sides — do NOT blindly pick one side.",
+	);
+	parts.push(
+		"   The goal is a correct union of both the task's changes and the main branch.",
+	);
+	parts.push(
+		"3. After resolving all conflicts, stage the resolved files with `git add <files>`.",
+	);
+	parts.push(
+		"4. Complete the merge with `git commit` — use the default merge message.",
+	);
+	parts.push("");
+	parts.push(
+		"Resolve ALL conflicts. Do NOT abort the merge. Do NOT leave any conflict markers.",
+	);
+
+	return parts.join("\n");
+}

@@ -17,6 +17,7 @@ import {
 	buildTaskPrompt,
 	buildReviewPrompt,
 	buildReviewPromptUncommitted,
+	buildConflictResolutionPrompt,
 	MAX_DIFF_BYTES,
 } from "./prompts";
 import { extractReflection } from "./reflection";
@@ -26,7 +27,17 @@ import {
 	verdictGlyph,
 	verdictSummary,
 } from "./review";
-import { createWorktree, mergeWorktree, removeWorktree } from "./worktree";
+import {
+	createWorktree,
+	mergeWorktree,
+	removeWorktree,
+	reattemptMerge,
+	abortMerge,
+	hasMergeConflicts,
+	completeMerge,
+	type WorktreeHandle,
+	type MergeResult,
+} from "./worktree";
 import {
 	runAgentSession,
 	writeFileSafe,
@@ -60,6 +71,22 @@ export type SendChatMessage = (
 export interface ToolCallEntry {
 	name: string;
 	label: string;
+}
+
+/** A merge conflict deferred from executeTask to batch-level resolution. */
+export interface BatchConflict {
+	task: Task;
+	worktree: WorktreeHandle;
+	mergeResult: MergeResult;
+	/** The task's run result (reflection, commits, etc.) from executeTask. */
+	result: {
+		reflection?: Reflection;
+		toolUsage?: ToolUsage;
+		outputPreview?: string;
+		commitMessages?: string[];
+		commitSummary?: string;
+		durationMs: number;
+	};
 }
 
 // ─── Widget Expand/Collapse ───────────────────────────────────────────────
@@ -460,6 +487,8 @@ export async function executeBatch(
 
 	const useWorktree = shouldUseWorktrees(config, !!shouldParallel);
 
+	const conflicts: BatchConflict[] = [];
+
 	if (shouldParallel) {
 		await executeBatchParallel(
 			tasks,
@@ -471,42 +500,68 @@ export async function executeBatch(
 			projectDir,
 			roundRobin,
 			useWorktree,
+			conflicts,
 		);
-		return;
+	} else {
+		// Execute sequentially (no round-robin — inherit parent model)
+		for (const task of tasks) {
+			try {
+				await executeTask(
+					task,
+					project,
+					config,
+					progress,
+					ctx,
+					sendChatMessage,
+					projectDir,
+					undefined, // parallelState
+					undefined, // assignedModel
+					undefined, // roundRobin
+					undefined, // batchRender
+					useWorktree,
+					conflicts,
+				);
+			} catch (error) {
+				// Task failed — stop the batch. Dependent tasks are blocked by
+				// the DAG layer (getBlockedTasks) so they won't appear in this batch.
+
+				const errorMsg = error instanceof Error ? error.message : String(error);
+				progress.markFailed(task.id, errorMsg);
+				// Auto-update the PRD source file checkbox
+				try {
+					updateTaskInFile(project.sourcePath, task.id, "failed");
+				} catch {
+					// Best-effort
+				}
+				sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${errorMsg}`);
+				ctx.ui.notify(`Task ${task.id} failed: ${errorMsg}`, "error");
+				break;
+			}
+		}
 	}
 
-	// Execute sequentially (no round-robin — inherit parent model)
-	for (const task of tasks) {
-		try {
-			await executeTask(
-				task,
-				project,
-				config,
-				progress,
+	// ── Batch-level conflict resolution ──
+	// After all tasks in the batch finish, resolve any deferred merge conflicts
+	// by spawning resolution agent sessions. This doesn't block parallel slots.
+	if (conflicts.length > 0) {
+		ctx.ui.notify(
+			`Resolving ${conflicts.length} merge conflict(s) from batch...`,
+			"info",
+		);
+		const dir = projectDir ?? project.sourceDir;
+		for (const c of conflicts) {
+			await resolveConflictsSession(
 				ctx,
+				config,
+				c.task,
+				project,
+				dir,
+				c.worktree,
+				config.model,
+				roundRobin,
+				progress,
 				sendChatMessage,
-				projectDir,
-				undefined, // parallelState
-				undefined, // assignedModel
-				undefined, // roundRobin
-				undefined, // batchRender
-				useWorktree,
 			);
-		} catch (error) {
-			// Task failed — stop the batch. Dependent tasks are blocked by
-			// the DAG layer (getBlockedTasks) so they won't appear in this batch.
-
-			const errorMsg = error instanceof Error ? error.message : String(error);
-			progress.markFailed(task.id, errorMsg);
-			// Auto-update the PRD source file checkbox
-			try {
-				updateTaskInFile(project.sourcePath, task.id, "failed");
-			} catch {
-				// Best-effort
-			}
-			sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${errorMsg}`);
-			ctx.ui.notify(`Task ${task.id} failed: ${errorMsg}`, "error");
-			break;
 		}
 	}
 }
@@ -524,6 +579,7 @@ async function executeBatchParallel(
 	projectDir?: string,
 	roundRobin?: ModelRoundRobin | null,
 	useWorktree?: boolean,
+	conflicts?: BatchConflict[],
 ): Promise<void> {
 	const maxParallel = config.execution.maxParallel;
 	const sharedState: ParallelWidgetState = new Map();
@@ -636,6 +692,7 @@ async function executeBatchParallel(
 				roundRobin,
 				requestBatchRender,
 				useWorktree,
+				conflicts,
 			)
 				.catch((error) => {
 					// Safety net: one task failure should never crash the batch.
@@ -694,6 +751,7 @@ async function executeTask(
 	roundRobin?: ModelRoundRobin | null,
 	batchRender?: () => void,
 	useWorktree?: boolean,
+	conflicts?: BatchConflict[],
 ): Promise<void> {
 	// Model failover: when a provider/API is down, cycle through available models.
 	// Pi's built-in retry (via SettingsManager) handles transient errors with
@@ -1100,19 +1158,38 @@ async function executeTask(
 
 				// ── Merge worktree back to main ──
 				// After the commit lands on the worktree branch, merge it into the
-				// main repo so downstream tasks see the changes. On conflict, the task
-				// is marked failed and the worktree is retained for inspection.
+				// main repo so downstream tasks see the changes. On conflict, the
+				// conflict is deferred to batch-level resolution (the caller collects
+				// conflicted worktrees and spawns resolution sessions after the batch).
 				if (wt) {
-					const mergeResult = mergeWorktree(projectDir, wt.branch, task.id);
+					const mergeResult = mergeWorktree(projectDir, wt.branch);
 					if (!mergeResult.success) {
 						sendChatMessage?.(
-							`✗ ${task.id} · ${task.title} — merge conflict, worktree retained at ${wt.dir}\n  ${mergeResult.message}`,
+							`⚠ ${task.id} · ${task.title} — merge conflict, deferring to batch resolution\n  ${mergeResult.message}`,
 						);
-						progress.markFailed(task.id, mergeResult.message);
-						try {
-							updateTaskInFile(project.sourcePath, task.id, "failed");
-						} catch {
-							// Best-effort
+						// Defer conflict resolution to the batch level.
+						if (conflicts) {
+							conflicts.push({
+								task,
+								worktree: wt,
+								mergeResult,
+								result: {
+									reflection: result.reflection,
+									toolUsage: result.toolUsage,
+									outputPreview: result.outputPreview,
+									commitMessages: finalCommitMessages,
+									commitSummary: finalCommitSummary,
+									durationMs: result.durationMs,
+								},
+							});
+						} else {
+							// No conflict collector — mark failed as fallback.
+							progress.markFailed(task.id, mergeResult.message);
+							try {
+								updateTaskInFile(project.sourcePath, task.id, "failed");
+							} catch {
+								// Best-effort
+							}
 						}
 						roundRobin?.release(task.id);
 						return;
@@ -1496,6 +1573,165 @@ async function runCommitSession(
 		toolCalls: commitToolCalls,
 		success: false,
 	};
+}
+
+// ─── Batch Conflict Resolution ───────────────────────────────────────────────
+
+/**
+ * Resolve a merge conflict by spawning an agent session in the main repo.
+ *
+ * The merge was already attempted (and aborted) by `mergeWorktree` during
+ * `executeTask`. This function re-attempts the merge to recreate the conflict
+ * state, spawns an agent to resolve all conflict markers, stage, and commit,
+ * then verifies completion. On success, the worktree is cleaned up and the
+ * task is marked completed. On failure, the merge is aborted and the task
+ * is marked failed (the worktree is retained for inspection).
+ *
+ * Runs after all tasks in a batch finish, so parallel task slots aren't
+ * blocked waiting for conflict resolution.
+ */
+async function resolveConflictsSession(
+	ctx: ExtensionContext,
+	config: RalpiConfig,
+	task: Task,
+	project: Project,
+	projectDir: string,
+	worktree: WorktreeHandle,
+	currentModel: unknown,
+	roundRobin: ModelRoundRobin | null | undefined,
+	progress: ProgressTracker,
+	sendChatMessage?: SendChatMessage,
+): Promise<void> {
+	const { branch } = worktree;
+
+	// Re-attempt the merge to recreate the conflict state in the main repo.
+	const attempt = reattemptMerge(projectDir, branch);
+	if (attempt.clean) {
+		// No conflicts on re-attempt — complete the merge directly.
+		if (completeMerge(projectDir)) {
+			sendChatMessage?.(
+				`✓ conflicts auto-resolved for ${task.id} · ${task.title}`,
+			);
+			removeWorktree(projectDir, worktree);
+			progress.markCompleted(
+				task.id,
+				0, // duration already tracked in executeTask
+				undefined,
+				undefined,
+				undefined,
+				[],
+				"",
+				undefined,
+				0,
+			);
+			try {
+				updateTaskInFile(project.sourcePath, task.id, "completed");
+			} catch {
+				// Best-effort
+			}
+			return;
+		}
+		// completeMerge failed — fall through to mark failed.
+		abortMerge(projectDir);
+		progress.markFailed(task.id, `Failed to complete merge of ${branch}`);
+		try {
+			updateTaskInFile(project.sourcePath, task.id, "failed");
+		} catch {
+			// Best-effort
+		}
+		return;
+	}
+
+	// Conflicts exist — spawn a resolution agent session.
+	const prompt = buildConflictResolutionPrompt(
+		task,
+		project,
+		attempt.conflicts,
+		branch,
+		config.prompts.projectContext,
+	);
+
+	const commitModel = resolveFollowUpModel(
+		ctx,
+		config.execution.commitModel,
+		currentModel,
+	);
+	const models = buildFailoverModels(commitModel, roundRobin);
+
+	sendChatMessage?.(
+		`⚑ resolving ${attempt.conflicts.length} conflict(s) for ${task.id} · ${task.title}...`,
+	);
+
+	const { result, toolCalls } = await runFollowUpSession(
+		ctx,
+		config,
+		prompt,
+		projectDir,
+		`resolve conflicts for ${task.id}`,
+		`resolve-${task.id}`,
+		config.execution.commitTimeoutMs,
+		models,
+	);
+
+	if (!result.success) {
+		sendChatMessage?.(
+			`~ conflict resolution for ${task.id} · ${task.title} — session failed: ${result.error}`,
+			{ toolCalls },
+		);
+		abortMerge(projectDir);
+		progress.markFailed(
+			task.id,
+			`Conflict resolution session failed: ${result.error}`,
+		);
+		try {
+			updateTaskInFile(project.sourcePath, task.id, "failed");
+		} catch {
+			// Best-effort
+		}
+		return;
+	}
+
+	// Check if the agent actually resolved all conflicts and committed.
+	if (hasMergeConflicts(projectDir)) {
+		// Agent didn't resolve everything — abort and fail.
+		sendChatMessage?.(
+			`✗ ${task.id} · ${task.title} — conflict resolution incomplete, ${attempt.conflicts.length} file(s) still conflicted`,
+			{ toolCalls },
+		);
+		abortMerge(projectDir);
+		progress.markFailed(
+			task.id,
+			`Conflict resolution incomplete — unresolved conflicts remaining`,
+		);
+		try {
+			updateTaskInFile(project.sourcePath, task.id, "failed");
+		} catch {
+			// Best-effort
+		}
+		return;
+	}
+
+	// Success — conflicts resolved and merge committed.
+	sendChatMessage?.(`✓ conflicts resolved for ${task.id} · ${task.title}`, {
+		toolCalls,
+	});
+	removeWorktree(projectDir, worktree);
+	progress.markCompleted(
+		task.id,
+		0,
+		undefined,
+		undefined,
+		undefined,
+		[],
+		"",
+		undefined,
+		0,
+	);
+	try {
+		updateTaskInFile(project.sourcePath, task.id, "completed");
+	} catch {
+		// Best-effort
+	}
 }
 
 /**

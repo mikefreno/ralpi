@@ -173,11 +173,7 @@ export function createWorktree(
  * branch's history. On conflict, the merge is aborted and the conflicts
  * are returned so the caller can mark the task as failed.
  */
-export function mergeWorktree(
-	mainDir: string,
-	branch: string,
-	taskId: string,
-): MergeResult {
+export function mergeWorktree(mainDir: string, branch: string): MergeResult {
 	// Attempt the merge.
 	const result = gitRaw(`merge --no-ff --no-edit "${branch}"`, mainDir);
 
@@ -207,6 +203,57 @@ export function mergeWorktree(
 				? `Merge conflicts in: ${conflicts.join(", ")}`
 				: `Merge of ${branch} failed: ${result.stderr || result.stdout}`,
 	};
+}
+
+/**
+ * Re-attempt a merge WITHOUT aborting on conflict.
+ *
+ * Unlike `mergeWorktree`, this leaves the main repo in a merge-conflict
+ * state so a conflict-resolution agent can see the conflict markers in the
+ * working tree and resolve them manually. The caller is responsible for
+ * committing the resolved merge or aborting it.
+ *
+ * Returns:
+ *  - `clean: true`  → merge succeeded (nothing staged to commit yet; the
+ *    caller should `git commit` or `git merge --abort` to finalise)
+ *  - `clean: false` → conflicts; working tree has conflict markers
+ */
+export function reattemptMerge(
+	mainDir: string,
+	branch: string,
+): { clean: boolean; conflicts: string[] } {
+	// Use --no-commit so even a clean merge doesn't auto-commit — the caller
+	// controls when the merge commit lands.
+	const result = gitRaw(`merge --no-ff --no-commit "${branch}"`, mainDir);
+
+	if (result.ok) {
+		return { clean: true, conflicts: [] };
+	}
+
+	// Merge produced conflicts — collect them but DO NOT abort.
+	const status = git("diff --name-only --diff-filter=U", mainDir) ?? "";
+	const conflicts = status
+		.split("\n")
+		.map((l) => l.trim())
+		.filter(Boolean);
+	return { clean: false, conflicts };
+}
+
+/** Abort an in-progress merge in the main repo. */
+export function abortMerge(mainDir: string): void {
+	git("merge --abort", mainDir);
+}
+
+/** Check if there are unmerged paths (conflicts) in the working tree. */
+export function hasMergeConflicts(mainDir: string): boolean {
+	const status = git("diff --name-only --diff-filter=U", mainDir) ?? "";
+	return status.trim().length > 0;
+}
+
+/** Complete the in-progress merge by committing. Returns true on success. */
+export function completeMerge(mainDir: string): boolean {
+	const result = gitRaw("commit --no-edit", mainDir);
+	return result.ok;
 }
 
 /**

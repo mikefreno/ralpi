@@ -278,7 +278,7 @@ export const DEFAULT_CONFIG: RalpiConfig = {
 		maxReviewRetries: 2, // 2 re-execution attempts on review rejection before giving up
 		reviewBlockOnFail: false, // false = commit anyway after retries exhausted
 		loopTimeoutMs: 0, // 0 = no limit
-		worktrees: "never", // worktree isolation per task
+		worktrees: "parallel", // worktree isolation for parallel tasks by default
 	},
 	prompts: {
 		projectContext: "",
