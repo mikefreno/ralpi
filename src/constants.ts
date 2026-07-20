@@ -26,5 +26,10 @@ export const TASK_FILE_NAMES = [
 export const REFLECTION_HEADER = "## REFLECTION";
 export const REFLECTION_PATTERN = /##\s*REFLECTION\s*\n([\s\S]*?)(?=\n```|$)/i;
 
+// Review verdict parsing
+export const REVIEW_HEADER = "## REVIEW VERDICT";
+export const REVIEW_PATTERN =
+	/##\s*REVIEW\s+VERDICT\s*\n([\s\S]*?)(?=\n```|$)/i;
+
 // Pi subprocess
 export const DEFAULT_PI_ARGS = ["--no-stream"] as const;

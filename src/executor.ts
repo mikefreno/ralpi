@@ -1,14 +1,31 @@
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import * as path from "node:path";
-import type { Task, Project, Reflection, ToolUsage } from "./types";
+import type {
+	Task,
+	Project,
+	Reflection,
+	ToolUsage,
+	ReviewResult,
+} from "./types";
 import type { RalpiConfig } from "./types";
 import type { ProgressTracker } from "./progress";
 import type {
 	ExtensionContext,
 	ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
-import { buildTaskPrompt, buildReviewPrompt, MAX_DIFF_BYTES } from "./prompts";
+import {
+	buildTaskPrompt,
+	buildReviewPrompt,
+	buildReviewPromptUncommitted,
+	MAX_DIFF_BYTES,
+} from "./prompts";
 import { extractReflection } from "./reflection";
+import {
+	extractReview,
+	saveReviewToFile as saveReviewJson,
+	verdictGlyph,
+	verdictSummary,
+} from "./review";
 import {
 	runAgentSession,
 	writeFileSafe,
@@ -34,6 +51,8 @@ export type SendChatMessage = (
 		reviewText?: string;
 		/** Saved file path when the review has been persisted to disk. */
 		reviewPath?: string;
+		/** Structured review result (when extractReview succeeded). */
+		reviewResult?: ReviewResult;
 	},
 ) => void;
 
@@ -168,6 +187,9 @@ export async function runTask(
 	parallelState?: ParallelWidgetState,
 	assignedModel?: unknown,
 	batchRender?: () => void,
+	/** Review feedback from a rejected review — injected when re-executing
+	 *  a task in review-gated mode so the agent knows what to fix. */
+	reviewFeedback?: ReviewResult,
 ): Promise<{
 	success: boolean;
 	reflection?: Reflection;
@@ -186,6 +208,7 @@ export async function runTask(
 		project,
 		depReflections,
 		config.prompts.projectContext,
+		reviewFeedback,
 	);
 
 	const taskHeader = `${task.id} · ${task.title}`;
@@ -698,106 +721,241 @@ async function executeTask(
 			);
 
 			if (result.success) {
-				// ── Auto-Commit: optionally trigger follow-up agent session for uncommitted changes ──
 				let finalCommitMessages = result.commitMessages ?? [];
 				let finalCommitSummary = result.commitSummary ?? "";
+				let finalReview: ReviewResult | undefined;
+				let reviewRetries = 0;
 
-				if (config.execution.autoCommit) {
+				if (config.execution.autoCommit && config.execution.autoReview) {
+					// ── Review-gated commit: review FIRST, loop on reject, commit on pass ──
+					// The review examines uncommitted changes before the commit. If the
+					// verdict is "fail", the task is re-executed with the review feedback
+					// injected into the prompt (up to maxReviewRetries). Only when the
+					// review passes (or retries exhaust) does the commit session run.
+					const maxRetries = config.execution.maxReviewRetries;
+					let attempt = 0;
+
 					try {
-						if (hasUncommittedChanges(projectDir)) {
+						while (hasUncommittedChanges(projectDir)) {
 							const status = getGitStatusPorcelain(projectDir);
-							let diff = getGitDiff(projectDir);
-							let diffNote = "";
-							if (diff.length > MAX_DIFF_BYTES) {
-								diffNote =
-									"\n\n... (diff truncated: omitted " +
-									(diff.length - MAX_DIFF_BYTES).toLocaleString() +
-									" bytes; run `git diff` to view the full diff)";
-								diff = diff.slice(0, MAX_DIFF_BYTES);
-							}
-							const commitPrompt = [
-								`## Auto-Commit for Task ${task.id}: ${task.title}`,
-								"",
-								"The previous task is complete. There are uncommitted changes in the repository.",
-								"",
-								"Only commit changes you made while completing this task. Do not commit pre-existing changes, changes from other work, or files unrelated to this task.",
-								"Review the git status and diff below to identify which changes are from your work, and stage only those files.",
-								"",
-								"Stage only the files relevant to this task with `git add <files>`, then create a meaningful git commit.",
-								"Use a descriptive commit message and follow conventional commits format.",
-								"Do NOT include the task number, task ID, or any ralpi task reference in the commit message. The commit message must describe only the work done — never mention the task ID (e.g. `task 03`, `#3`, etc.).",
-								"",
-								"### Current Changes (git status --porcelain)",
-								"```text",
-								status || "(no status output)",
-								"```",
-								"",
-								"### Current Tracked Diff (git diff)",
-								"```diff",
-								diff || "(no tracked diff output)",
-								diffNote,
-								"```",
-							].join("\n");
+							const reviewDiff = getGitDiff(projectDir);
+							if (!reviewDiff && !status) break;
 
-							// Resolve commit model (fall back to current task model)
-							const commitModel =
-								resolveModelSpec(
-									ctx.modelRegistry as
-										| { find(p: string, m: string): unknown }
-										| undefined,
-									config.execution.commitModel,
-									(msg) => ctx.ui.notify(msg, "warning"),
-								) ?? currentModel;
+							const reviewPrompt = buildReviewPromptUncommitted(
+								task,
+								project,
+								status,
+								reviewDiff,
+								config.prompts.projectContext,
+							);
 
-							// Build failover list: primary model first, then the rest of the pool.
-							const commitModels = buildFailoverModels(commitModel, roundRobin);
+							const reviewModel = resolveFollowUpModel(
+								ctx,
+								config.execution.reviewModel,
+								currentModel,
+							);
+							const reviewModels = buildFailoverModels(reviewModel, roundRobin);
 
-							const { result: commitResult, toolCalls: commitToolCalls } =
+							const { result: reviewResult, toolCalls: reviewToolCalls } =
 								await runFollowUpSession(
 									ctx,
 									config,
-									commitPrompt,
+									reviewPrompt,
 									projectDir,
-									`commit for ${task.id} · ${task.title}`,
-									`commit-${task.id}`,
-									config.execution.commitTimeoutMs,
-									commitModels,
+									`review for ${task.id} · ${task.title}${
+										attempt > 0 ? ` (attempt ${attempt + 1})` : ""
+									}`,
+									`review-${task.id}`,
+									config.execution.reviewTimeoutMs,
+									reviewModels,
 								);
 
-							if (commitResult.success) {
-								// Re-capture commits made during this follow-up session
-								const newCommits = captureGitCommits(projectDir);
-								if (newCommits.commitMessages.length > 0) {
-									finalCommitMessages = [
-										...finalCommitMessages,
-										...newCommits.commitMessages,
-									];
-									finalCommitSummary = finalCommitSummary
-										? `${finalCommitSummary}; ${newCommits.commitSummary}`
-										: newCommits.commitSummary;
-								}
-								sendChatMessage?.(`✓ commit for ${task.id} · ${task.title}`, {
-									toolCalls: commitToolCalls,
-								});
-							} else {
+							if (!reviewResult.success) {
 								sendChatMessage?.(
-									`~ commit for ${task.id} · ${task.title} — follow-up commit session failed: ${commitResult.error}`,
-									{ toolCalls: commitToolCalls },
+									`~ review for ${task.id} · ${task.title} — review session failed: ${reviewResult.error}`,
+									{ toolCalls: reviewToolCalls },
 								);
+								break; // commit what we have
+							}
+
+							const reviewText = reviewResult.text.trim();
+							const review = extractReview(reviewText, task.id, "uncommitted");
+							finalReview = review ?? undefined;
+
+							// Persist structured review JSON when opted in.
+							let reviewPath: string | undefined;
+							if (review && config.execution.saveReviews) {
+								reviewPath = saveReviewJson(
+									projectDir,
+									config.paths.reviewsDir,
+									review,
+									progress.getKey(),
+								);
+							}
+
+							if (
+								review &&
+								(review.verdict === "pass" || review.verdict === "warn")
+							) {
+								// Review passed — proceed to commit.
+								const label = `${verdictGlyph(review.verdict)} ${verdictSummary(review)}`;
+								const savedHint = reviewPath ? ` · saved to ${reviewPath}` : "";
+								sendChatMessage?.(
+									`⚑ review for ${task.id} · ${task.title} — ${label}${savedHint}`,
+									{
+										toolCalls: reviewToolCalls,
+										reviewText,
+										reviewPath,
+										reviewResult: review,
+									},
+								);
+								break; // good to commit
+							}
+
+							// Review rejected (fail) or verdict not parsed.
+							if (review) {
+								sendChatMessage?.(
+									`⚑ review for ${task.id} · ${task.title} — ${verdictGlyph(review.verdict)} ${verdictSummary(review)}`,
+									{
+										toolCalls: reviewToolCalls,
+										reviewText,
+										reviewPath,
+										reviewResult: review,
+									},
+								);
+							} else {
+								const lines = reviewText.split("\n").filter((l) => l.trim());
+								const tail = lines.slice(-3).join("\n");
+								const savedHint = reviewPath ? ` · saved to ${reviewPath}` : "";
+								sendChatMessage?.(
+									`⚑ review for ${task.id} · ${task.title} — verdict not found${savedHint}\n${tail}`,
+									{ toolCalls: reviewToolCalls, reviewText, reviewPath },
+								);
+							}
+
+							if (attempt >= maxRetries) {
+								// Retries exhausted.
+								if (config.execution.reviewBlockOnFail) {
+									sendChatMessage?.(
+										`✗ ${task.id} · ${task.title} — review rejected after ${maxRetries} retr${maxRetries === 1 ? "y" : "ies"} (reviewBlockOnFail)`,
+									);
+									progress.markFailed(
+										task.id,
+										`Review rejected after ${maxRetries} re-execution attempt(s)`,
+									);
+									try {
+										updateTaskInFile(project.sourcePath, task.id, "failed");
+									} catch {
+										// Best-effort
+									}
+									roundRobin?.release(task.id);
+									return;
+								}
+								sendChatMessage?.(
+									`~ review for ${task.id} · ${task.title} — max retries (${maxRetries}) exhausted, committing anyway`,
+								);
+								break; // commit what we have
+							}
+
+							attempt++;
+							reviewRetries++;
+							sendChatMessage?.(
+								`↻ review for ${task.id} · ${task.title} — verdict ${review?.verdict ?? "unknown"}, re-executing with feedback (${attempt}/${maxRetries})...`,
+							);
+
+							// Re-execute the task with review feedback injected.
+							const fixResult = await runTask(
+								task,
+								project,
+								config,
+								depReflections,
+								ctx,
+								sendChatMessage,
+								projectDir,
+								parallelState,
+								currentModel,
+								batchRender,
+								review ?? undefined,
+							);
+
+							if (!fixResult.success) {
+								sendChatMessage?.(
+									`~ re-execution for ${task.id} · ${task.title} failed: ${fixResult.error}`,
+								);
+								break; // commit what we have
+							}
+
+							// Merge commit messages from the fix attempt.
+							finalCommitMessages = [
+								...finalCommitMessages,
+								...(fixResult.commitMessages ?? []),
+							];
+							finalCommitSummary = finalCommitSummary
+								? `${finalCommitSummary}; ${fixResult.commitSummary ?? ""}`
+								: (fixResult.commitSummary ?? "");
+							// Loop back to review the updated changes.
+						}
+
+						// ── Commit (after review passes or retries exhausted) ──
+						if (hasUncommittedChanges(projectDir)) {
+							const commitResult = await runCommitSession(
+								ctx,
+								config,
+								task,
+								projectDir,
+								currentModel,
+								roundRobin,
+								sendChatMessage,
+							);
+							if (commitResult.success) {
+								finalCommitMessages = [
+									...finalCommitMessages,
+									...commitResult.commitMessages,
+								];
+								finalCommitSummary = finalCommitSummary
+									? `${finalCommitSummary}; ${commitResult.commitSummary}`
+									: commitResult.commitSummary;
 							}
 						}
 					} catch (error) {
-						// Don't fail the task if auto-commit fails
+						sendChatMessage?.(
+							`~ review/commit for ${task.id} · ${task.title} — error: ${
+								error instanceof Error ? error.message : String(error)
+							}`,
+						);
+					}
+				} else if (config.execution.autoCommit) {
+					// ── Commit only (no review) — legacy path ──
+					try {
+						if (hasUncommittedChanges(projectDir)) {
+							const commitResult = await runCommitSession(
+								ctx,
+								config,
+								task,
+								projectDir,
+								currentModel,
+								roundRobin,
+								sendChatMessage,
+							);
+							if (commitResult.success) {
+								finalCommitMessages = [
+									...finalCommitMessages,
+									...commitResult.commitMessages,
+								];
+								finalCommitSummary = finalCommitSummary
+									? `${finalCommitSummary}; ${commitResult.commitSummary}`
+									: commitResult.commitSummary;
+							}
+						}
+					} catch (error) {
 						sendChatMessage?.(
 							`~ commit for ${task.id} · ${task.title} — auto-commit error: ${
 								error instanceof Error ? error.message : String(error)
 							}`,
 						);
 					}
-				}
-
-				// ── Auto-Review: optionally spawn a review agent to review the latest commit ──
-				if (config.execution.autoReview) {
+				} else if (config.execution.autoReview) {
+					// ── Review only (no commit) — reviews latest commit — legacy path ──
 					try {
 						const commitInfo = getLatestCommitDiff(projectDir);
 						if (commitInfo && commitInfo.diff) {
@@ -810,17 +968,11 @@ async function executeTask(
 								config.prompts.projectContext,
 							);
 
-							// Resolve review model (fall back to current task model)
-							const reviewModel =
-								resolveModelSpec(
-									ctx.modelRegistry as
-										| { find(p: string, m: string): unknown }
-										| undefined,
-									config.execution.reviewModel,
-									(msg) => ctx.ui.notify(msg, "warning"),
-								) ?? currentModel;
-
-							// Build failover list: primary model first, then the rest of the pool.
+							const reviewModel = resolveFollowUpModel(
+								ctx,
+								config.execution.reviewModel,
+								currentModel,
+							);
 							const reviewModels = buildFailoverModels(reviewModel, roundRobin);
 
 							const { result: reviewResult, toolCalls: reviewToolCalls } =
@@ -837,35 +989,48 @@ async function executeTask(
 
 							if (reviewResult.success) {
 								const reviewText = reviewResult.text.trim();
+								const review = extractReview(
+									reviewText,
+									task.id,
+									commitInfo.hash,
+								);
+								finalReview = review ?? undefined;
 
-								// Persist the full review to disk when opted in at loop
-								// start. Mirrors the reflections layout so a repo can
-								// hold many loops without collisions:
-								//   .ralpi/reviews/<prdKey>/<taskId>.md
 								let reviewPath: string | undefined;
-								if (config.execution.saveReviews) {
-									reviewPath = saveReviewToFile(
+								if (review && config.execution.saveReviews) {
+									reviewPath = saveReviewJson(
 										projectDir,
-										config,
-										task.id,
-										reviewText,
+										config.paths.reviewsDir,
+										review,
 										progress.getKey(),
 									);
 								}
 
-								// Post review as a chat message. The full body is
-								// passed via meta.reviewText so the expanded (Ctrl+O)
-								// view can render it without truncation; the collapsed
-								// content shows a short tail + a hint to expand.
-								const lines = reviewText.split("\n").filter((l) => l.trim());
-								const tail = lines.slice(-3).join("\n");
-								const savedHint = reviewPath
-									? ` \u00b7 saved to ${reviewPath}`
-									: "";
-								sendChatMessage?.(
-									`⚑ review for ${task.id} · ${task.title}${savedHint}\n${tail}`,
-									{ toolCalls: reviewToolCalls, reviewText, reviewPath },
-								);
+								if (review) {
+									const label = `${verdictGlyph(review.verdict)} ${verdictSummary(review)}`;
+									const savedHint = reviewPath
+										? ` · saved to ${reviewPath}`
+										: "";
+									sendChatMessage?.(
+										`⚑ review for ${task.id} · ${task.title} — ${label}${savedHint}`,
+										{
+											toolCalls: reviewToolCalls,
+											reviewText,
+											reviewPath,
+											reviewResult: review,
+										},
+									);
+								} else {
+									const lines = reviewText.split("\n").filter((l) => l.trim());
+									const tail = lines.slice(-3).join("\n");
+									const savedHint = reviewPath
+										? ` \u00b7 saved to ${reviewPath}`
+										: "";
+									sendChatMessage?.(
+										`⚑ review for ${task.id} · ${task.title}${savedHint}\n${tail}`,
+										{ toolCalls: reviewToolCalls, reviewText, reviewPath },
+									);
+								}
 							} else {
 								sendChatMessage?.(
 									`~ review for ${task.id} · ${task.title} — review session failed: ${reviewResult.error}`,
@@ -874,7 +1039,6 @@ async function executeTask(
 							}
 						}
 					} catch (error) {
-						// Don't fail the task if auto-review fails
 						sendChatMessage?.(
 							`~ review for ${task.id} · ${task.title} — auto-review error: ${
 								error instanceof Error ? error.message : String(error)
@@ -902,6 +1066,8 @@ async function executeTask(
 					result.outputPreview,
 					finalCommitMessages,
 					finalCommitSummary,
+					finalReview,
+					reviewRetries,
 				);
 				// Auto-update the PRD source file checkbox
 				try {
@@ -985,24 +1151,6 @@ function saveReflectionToFile(
 	ensureDir(reflectionsDir);
 	const filePath = path.join(reflectionsDir, `${reflection.taskId}.json`);
 	writeFileSafe(filePath, JSON.stringify(reflection, null, 2));
-}
-
-// ─── Save Review Output to File ─────────────────────────────────────────────
-// Mirrors saveReflectionToFile's per-loop layout so a repo can hold many
-// loops without collisions: .ralpi/reviews/<prdKey>/<taskId>.md
-
-function saveReviewToFile(
-	sourceDir: string,
-	config: RalpiConfig,
-	taskId: string,
-	reviewText: string,
-	prdKey: string,
-): string {
-	const reviewsDir = path.join(sourceDir, config.paths.reviewsDir, prdKey);
-	ensureDir(reviewsDir);
-	const filePath = path.join(reviewsDir, `${taskId}.md`);
-	writeFileSafe(filePath, reviewText);
-	return filePath;
 }
 
 // ─── Follow-Up Sessions (Commit / Review) ─────────────────────────────────────
@@ -1158,6 +1306,129 @@ function buildFailoverModels(
 }
 
 // ─── Tool Call Formatting ────────────────────────────────────────────────
+
+/**
+ * Shorthand type for the model registry's find() shape.
+ */
+type ModelRegistryLike = { find(p: string, m: string): unknown };
+
+/**
+ * Resolve a model spec for a follow-up session (commit/review), falling back
+ * to `currentModel` when the config field is blank or the registry can't
+ * resolve it. Warns via `ctx.ui.notify` on resolution failure.
+ */
+function resolveFollowUpModel(
+	ctx: ExtensionContext,
+	spec: string,
+	currentModel: unknown,
+): unknown {
+	return (
+		resolveModelSpec(
+			ctx.modelRegistry as ModelRegistryLike | undefined,
+			spec,
+			(msg) => ctx.ui.notify(msg, "warning"),
+		) ?? currentModel
+	);
+}
+
+/**
+ * Run the auto-commit follow-up agent session.
+ * Returns the commit messages, summary, tool calls, and success flag.
+ */
+async function runCommitSession(
+	ctx: ExtensionContext,
+	config: RalpiConfig,
+	task: Task,
+	projectDir: string,
+	currentModel: unknown,
+	roundRobin: ModelRoundRobin | null | undefined,
+	sendChatMessage?: SendChatMessage,
+): Promise<{
+	commitMessages: string[];
+	commitSummary: string;
+	toolCalls: ToolCallEntry[];
+	success: boolean;
+}> {
+	const status = getGitStatusPorcelain(projectDir);
+	let diff = getGitDiff(projectDir);
+	let diffNote = "";
+	if (diff.length > MAX_DIFF_BYTES) {
+		diffNote =
+			"\n\n... (diff truncated: omitted " +
+			(diff.length - MAX_DIFF_BYTES).toLocaleString() +
+			" bytes; run `git diff` to view the full diff)";
+		diff = diff.slice(0, MAX_DIFF_BYTES);
+	}
+	const commitPrompt = [
+		`## Auto-Commit for Task ${task.id}: ${task.title}`,
+		"",
+		"The previous task is complete. There are uncommitted changes in the repository.",
+		"",
+		"Only commit changes you made while completing this task. Do not commit pre-existing changes, changes from other work, or files unrelated to this task.",
+		"Review the git status and diff below to identify which changes are from your work, and stage only those files.",
+		"",
+		"Stage only the files relevant to this task with `git add <files>`, then create a meaningful git commit.",
+		"Use a descriptive commit message and follow conventional commits format.",
+		"Do NOT include the task number, task ID, or any ralpi task reference in the commit message. The commit message must describe only the work done — never mention the task ID (e.g. `task 03`, `#3`, etc.).",
+		"",
+		"### Current Changes (git status --porcelain)",
+		"```text",
+		status || "(no status output)",
+		"```",
+		"",
+		"### Current Tracked Diff (git diff)",
+		"```diff",
+		diff || "(no tracked diff output)",
+		diffNote,
+		"```",
+	].join("\n");
+
+	const commitModel = resolveFollowUpModel(
+		ctx,
+		config.execution.commitModel,
+		currentModel,
+	);
+	const commitModels = buildFailoverModels(commitModel, roundRobin);
+
+	const { result: commitResult, toolCalls: commitToolCalls } =
+		await runFollowUpSession(
+			ctx,
+			config,
+			commitPrompt,
+			projectDir,
+			`commit for ${task.id} · ${task.title}`,
+			`commit-${task.id}`,
+			config.execution.commitTimeoutMs,
+			commitModels,
+		);
+
+	if (commitResult.success) {
+		const newCommits = captureGitCommits(projectDir);
+		const commitMessages =
+			newCommits.commitMessages.length > 0 ? newCommits.commitMessages : [];
+		const commitSummary = newCommits.commitSummary || "";
+		sendChatMessage?.(`✓ commit for ${task.id} · ${task.title}`, {
+			toolCalls: commitToolCalls,
+		});
+		return {
+			commitMessages,
+			commitSummary,
+			toolCalls: commitToolCalls,
+			success: true,
+		};
+	}
+
+	sendChatMessage?.(
+		`~ commit for ${task.id} · ${task.title} — follow-up commit session failed: ${commitResult.error}`,
+		{ toolCalls: commitToolCalls },
+	);
+	return {
+		commitMessages: [],
+		commitSummary: "",
+		toolCalls: commitToolCalls,
+		success: false,
+	};
+}
 
 /**
  * Strip control characters and newlines from a display label so it

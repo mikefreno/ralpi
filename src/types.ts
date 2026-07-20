@@ -103,6 +103,37 @@ export interface Reflection {
 	timestamp: string;
 }
 
+// ─── Review Model ────────────────────────────────────────────────────────────
+
+export type ReviewVerdict = "pass" | "warn" | "fail";
+
+export interface ReviewFinding {
+	/** Severity of the finding */
+	severity: "blocker" | "warning" | "nit" | "info";
+	/** File path if applicable */
+	file?: string;
+	/** Line number if applicable */
+	line?: number;
+	/** Description of the issue */
+	message: string;
+}
+
+export interface ReviewResult {
+	taskId: string;
+	/** Overall verdict */
+	verdict: ReviewVerdict;
+	/** 1-2 sentence overall assessment */
+	summary: string;
+	/** Structured findings (empty when verdict is "pass") */
+	findings: ReviewFinding[];
+	/** Commit hash the review was performed against */
+	commitHash: string;
+	/** Full free-form review text (preserved for display) */
+	rawText: string;
+	/** ISO timestamp */
+	timestamp: string;
+}
+
 export interface ToolUsage {
 	read: number;
 	write: number;
@@ -117,6 +148,8 @@ export interface TaskProgressInfo {
 	completedAt?: string;
 	durationMs?: number;
 	reflection?: Reflection;
+	/** Structured review result (when autoReview is enabled) */
+	review?: ReviewResult;
 	error?: string;
 	/** Tool usage counts from parsed subprocess output */
 	toolUsage?: ToolUsage;
@@ -126,6 +159,8 @@ export interface TaskProgressInfo {
 	commitMessages?: string[];
 	/** Summary derived from git commits */
 	commitSummary?: string;
+	/** Number of review-fix re-execution attempts made (review-gated mode) */
+	reviewRetries?: number;
 }
 
 export interface ProgressState {
@@ -194,6 +229,13 @@ export interface RalpiConfig {
 		commitTimeoutMs: number;
 		/** Timeout for auto-review agent sessions in milliseconds */
 		reviewTimeoutMs: number;
+		/** Max review-fix re-execution attempts before giving up and committing
+		 *  anyway (0 = no retries; review runs once, reject = commit anyway).
+		 *  Only active when both autoCommit AND autoReview are enabled. */
+		maxReviewRetries: number;
+		/** When true, a 'fail' review verdict after exhausting maxReviewRetries
+		 *  marks the task as failed instead of committing. */
+		reviewBlockOnFail: boolean;
 		/** Maximum total duration for the entire loop execution in milliseconds (0 = no limit). Checked between batches — in-progress tasks finish naturally. */
 		loopTimeoutMs: number;
 	};
@@ -227,6 +269,8 @@ export const DEFAULT_CONFIG: RalpiConfig = {
 		implModel: "",
 		commitTimeoutMs: 0, // 0 = inherit Pi's own defaults (no ralpi-level timeout)
 		reviewTimeoutMs: 0, // 0 = inherit Pi's own defaults (no ralpi-level timeout)
+		maxReviewRetries: 2, // 2 re-execution attempts on review rejection before giving up
+		reviewBlockOnFail: false, // false = commit anyway after retries exhausted
 		loopTimeoutMs: 0, // 0 = no limit
 	},
 	prompts: {

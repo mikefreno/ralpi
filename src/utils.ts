@@ -40,7 +40,8 @@ export function writeFileSafe(filePath: string, content: string): void {
 
 /**
  * State persisted to disk when a ralpi execution loop is active.
- * Used to re-instantiate widgets after a session reload.
+ * Used to re-instantiate widgets after a session reload, and to resume
+ * the loop non-interactively when a reload interrupts in-progress tasks.
  */
 export interface LoopActiveState {
 	taskFile: string;
@@ -48,6 +49,11 @@ export interface LoopActiveState {
 	startedAt: string;
 	taskIds: string[];
 	prdKey: string;
+	/** Loop option snapshot at loop start, so a reload can resume without
+	 *  re-prompting the user. */
+	autoCommit?: boolean;
+	autoReview?: boolean;
+	saveReviews?: boolean;
 }
 
 /**

@@ -1,4 +1,4 @@
-import type { Task, Project, Reflection } from "./types";
+import type { Task, Project, Reflection, ReviewResult } from "./types";
 import { readTaskSpec } from "./parser";
 
 /** Maximum bytes of a commit diff embedded in a review/commit prompt.
@@ -35,6 +35,9 @@ export function buildTaskPrompt(
 	project: Project,
 	depReflections: Reflection[],
 	projectContext?: string,
+	/** Review feedback from a rejected review — injected when re-executing
+	 *  a task in review-gated mode so the agent knows what to fix. */
+	reviewFeedback?: ReviewResult,
 ): string {
 	const parts: string[] = [];
 
@@ -127,6 +130,32 @@ export function buildTaskPrompt(
 	if (projectContext) {
 		parts.push("## Additional Context");
 		parts.push(projectContext);
+		parts.push("");
+	}
+
+	// ── Previous Review Feedback (re-execution only) ──
+
+	if (reviewFeedback) {
+		parts.push("## Previous Review Feedback — FIX REQUIRED");
+		parts.push(
+			"A review agent examined your previous attempt and rejected it.",
+		);
+		parts.push(`Verdict: **${reviewFeedback.verdict.toUpperCase()}**`);
+		parts.push(`Summary: ${reviewFeedback.summary}`);
+		parts.push("");
+		if (reviewFeedback.findings.length > 0) {
+			parts.push("You MUST address these findings:");
+			for (const finding of reviewFeedback.findings) {
+				const loc = finding.file
+					? finding.line
+						? ` (${finding.file}:${finding.line})`
+						: ` (${finding.file})`
+					: "";
+				parts.push(`- [${finding.severity}]${loc} ${finding.message}`);
+			}
+			parts.push("");
+		}
+		parts.push("Fix every issue above. Do not re-introduce the same problems.");
 		parts.push("");
 	}
 
@@ -227,22 +256,139 @@ export function buildReviewPrompt(
 	parts.push(
 		"Review the commit above against the task description. Check for:",
 	);
-	parts.push(
-		"- **Correctness**: Does the implementation fulfill the task requirements?",
-	);
-	parts.push("- **Completeness**: Are all aspects of the task addressed?");
-	parts.push(
-		"- **Code quality**: Are there obvious bugs, anti-patterns, or issues?",
-	);
-	parts.push(
-		"- **Missing changes**: Are there files that should have been modified but weren't?",
-	);
+	parts.push(...reviewInstructions());
 	parts.push("");
 	parts.push(
-		"Provide a concise review with any issues found. If the commit looks good, say so explicitly.",
+		"Provide a concise review with any issues found. Your free-form prose",
 	);
+	parts.push("precedes the structured verdict block below.");
+	parts.push(...reviewVerdictBlock());
 
 	return parts.join("\n");
+}
+
+// ─── Uncommitted-Changes Review Prompt ──────────────────────────────────────
+
+/**
+ * Build a review prompt for uncommitted working-tree changes (pre-commit).
+ * Used in review-gated mode: the review runs BEFORE committing so a rejected
+ * review triggers a re-execution instead of a bad commit.
+ */
+export function buildReviewPromptUncommitted(
+	task: Task,
+	project: Project,
+	status: string,
+	diff: string,
+	projectContext?: string,
+): string {
+	const parts: string[] = [];
+
+	parts.push(`# Code Review (pre-commit): Task ${task.id}: ${task.title}`);
+	parts.push("");
+
+	// ── Task Description ──
+
+	parts.push("## Task Description");
+	if (task.description) {
+		parts.push(task.description);
+	} else {
+		parts.push(task.title);
+	}
+	parts.push("");
+
+	// ── Task Specification ──
+
+	if (task.file) {
+		const spec = readTaskSpec(project.sourceDir, task.file);
+		if (spec) {
+			parts.push("## Task Specification");
+			parts.push(`Full details from \`${task.file}\`:`);
+			parts.push("");
+			parts.push(spec);
+			parts.push("");
+		}
+	}
+
+	// ── Uncommitted Changes Under Review ──
+
+	parts.push("## Uncommitted Changes Under Review");
+	parts.push(
+		"Review the working-tree changes below against the task description.",
+	);
+	parts.push("");
+	parts.push("### Current Changes (git status --porcelain)");
+	parts.push("```text");
+	parts.push(status || "(no status output)");
+	parts.push("```");
+	parts.push("");
+	parts.push("### Current Tracked Diff (git diff)");
+	parts.push("```diff");
+	parts.push(truncateDiff(diff) || "(no tracked diff output)");
+	parts.push("```");
+	parts.push("");
+
+	// ── Project Context ──
+
+	if (projectContext) {
+		parts.push("## Additional Context");
+		parts.push(projectContext);
+		parts.push("");
+	}
+
+	// ── Review Instructions ──
+
+	parts.push("## Review Instructions");
+	parts.push(
+		"Review the uncommitted changes above against the task description. Check for:",
+	);
+	parts.push(...reviewInstructions());
+	parts.push("");
+	parts.push(
+		"Provide a concise review with any issues found. Your free-form prose",
+	);
+	parts.push("precedes the structured verdict block below.");
+	parts.push(...reviewVerdictBlock());
+
+	return parts.join("\n");
+}
+
+// ─── Shared Review Prompt Helpers ───────────────────────────────────────────
+
+function reviewInstructions(): string[] {
+	return [
+		"- **Correctness**: Does the implementation fulfill the task requirements?",
+		"- **Completeness**: Are all aspects of the task addressed?",
+		"- **Code quality**: Are there obvious bugs, anti-patterns, or issues?",
+		"- **Missing changes**: Are there files that should have been modified but weren't?",
+	];
+}
+
+function reviewVerdictBlock(): string[] {
+	return [
+		"## REVIEW VERDICT (REQUIRED)",
+		"End your response with a verdict block in EXACTLY this format:",
+		"",
+		"```",
+		"## REVIEW VERDICT",
+		"VERDICT: [pass | warn | fail]",
+		"SUMMARY: [1-2 sentence overall assessment]",
+		"FINDINGS:",
+		"- [blocker] file:line description  (use severity: blocker|warning|nit|info)",
+		"- [warning] file:line description",
+		"```",
+		"",
+		"Verdict guidance:",
+		"- **pass**: the implementation fully satisfies the task requirements; no",
+		"  action needed. Use an empty FINDINGS section (just the header).",
+		"- **warn**: the implementation is acceptable but has minor issues worth fixing",
+		"  in a follow-up; not blocking.",
+		"- **fail**: the implementation does not satisfy the task, or has serious bugs",
+		"  that must be fixed before proceeding.",
+		"",
+		"Each FINDINGS line uses the form `- [severity] [file:line] message`.",
+		"The `file:line` part is optional. Severity must be one of:",
+		"`blocker`, `warning`, `nit`, `info`.",
+	];
 }
 
 /**

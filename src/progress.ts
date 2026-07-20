@@ -6,6 +6,7 @@ import type {
 	Task,
 	Reflection,
 	ToolUsage,
+	ReviewResult,
 } from "./types";
 import { ensureDir } from "./utils";
 
@@ -174,6 +175,8 @@ export class ProgressTracker {
 		outputPreview?: string,
 		commitMessages?: string[],
 		commitSummary?: string,
+		review?: ReviewResult,
+		reviewRetries?: number,
 	): void {
 		const prd = this.getPRD();
 		this.ensureTask(prd, taskId);
@@ -185,6 +188,9 @@ export class ProgressTracker {
 		if (outputPreview) prd.tasks[taskId].outputPreview = outputPreview;
 		if (commitMessages) prd.tasks[taskId].commitMessages = commitMessages;
 		if (commitSummary) prd.tasks[taskId].commitSummary = commitSummary;
+		if (review) prd.tasks[taskId].review = review;
+		if (reviewRetries !== undefined)
+			prd.tasks[taskId].reviewRetries = reviewRetries;
 		this.save();
 	}
 
@@ -242,6 +248,26 @@ export class ProgressTracker {
 		const prd = this.getPRD();
 		prd.paused = paused;
 		this.save();
+	}
+
+	/** Reset all `in_progress` tasks back to `pending`.
+	 *
+	 * Used after a session reload: in-process agent sessions die with the
+	 * parent session, so any task left `in_progress` is actually stalled.
+	 * Resetting ensures the DAG re-schedules it on the next resume. Returns
+	 * the IDs that were reset. */
+	resetInProgressToPending(): string[] {
+		const prd = this.getPRD();
+		const reset: string[] = [];
+		for (const [id, info] of Object.entries(prd.tasks)) {
+			if (info.status === "in_progress") {
+				info.status = "pending";
+				delete info.startedAt;
+				reset.push(id);
+			}
+		}
+		if (reset.length > 0) this.save();
+		return reset;
 	}
 
 	/** Get the raw PRD state (for status display) */

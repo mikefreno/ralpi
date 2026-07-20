@@ -15,11 +15,9 @@ import {
 import { ProgressTracker } from "./src/progress";
 import { buildPlanPrompt } from "./src/prompts";
 import { formatReflections } from "./src/reflection";
-import {
-	executeBatch,
-	SPINNER_FRAMES,
-	type SendChatMessage,
-} from "./src/executor";
+import { verdictGlyph, verdictSummary, formatFindings } from "./src/review";
+import type { ReviewResult } from "./src/types";
+import { executeBatch, type SendChatMessage } from "./src/executor";
 import {
 	loadConfig,
 	resolveTaskArg,
@@ -243,7 +241,9 @@ async function executePlanBatches(
 	sendChatMessage?: SendChatMessage,
 	projectDir?: string,
 ): Promise<void> {
-	// Write loop-active marker so widgets can be re-instantiated after a reload
+	// Write loop-active marker so a session reload can detect an interrupted
+	// loop and resume it (in-process agent sessions die on reload — the marker
+	// + progress.json in_progress tasks are the signal to re-run them).
 	if (projectDir) {
 		const allTaskIds = plan.batches.flatMap((b) => b.tasks.map((t) => t.id));
 		writeLoopActive(projectDir, {
@@ -252,6 +252,9 @@ async function executePlanBatches(
 			startedAt: new Date().toISOString(),
 			taskIds: allTaskIds,
 			prdKey: progress.getKey(),
+			autoCommit: config.execution.autoCommit,
+			autoReview: config.execution.autoReview,
+			saveReviews: config.execution.saveReviews,
 		});
 	}
 
@@ -371,6 +374,7 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 						toolCalls?: Array<{ name: string; label: string }>;
 						reviewText?: string;
 						reviewPath?: string;
+						reviewResult?: ReviewResult;
 				  }
 				| undefined;
 
@@ -380,12 +384,34 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 			// Header line — e.g. "✓ 05 · billing-subscriptions-trials (2m 14s)"
 			lines.push(String(message.content));
 
-			// Review body: in expanded mode render the full review text so long
-			// reviews aren't lost to the 500-char preview. In collapsed mode
-			// show a dim hint that the review is available via Ctrl+O (the
-			// header already carries a short tail + saved-path hint).
-			const hasReview = !!details?.reviewText;
-			if (hasReview && expanded && details!.reviewText) {
+			// Structured review: when we have a ReviewResult, render verdict +
+			// findings tree. In expanded mode show findings detail; collapsed
+			// shows the verdict summary + a hint to expand.
+			const hasReview = !!details?.reviewText || !!details?.reviewResult;
+			if (details?.reviewResult) {
+				const rv = details.reviewResult;
+				const glyph = verdictGlyph(rv.verdict);
+				const summary = verdictSummary(rv);
+				if (expanded) {
+					// Show verdict, summary, then findings tree, then raw text.
+					lines.push(`  ${glyph} VERDICT: ${rv.verdict.toUpperCase()}`);
+					lines.push(`  ${rv.summary}`);
+					if (rv.findings.length > 0) {
+						lines.push(`  ${formatFindings(rv)}`);
+					}
+					if (details.reviewText) {
+						const body = details.reviewText.split("\n");
+						for (const line of body) {
+							lines.push(`  ${line}`);
+						}
+					}
+				} else {
+					const hint = details.reviewPath
+						? `press Ctrl+O for full review · saved to ${details.reviewPath}`
+						: "press Ctrl+O for full review";
+					lines.push(theme.fg("dim", `  ├── ${glyph} ${summary} · ${hint}`));
+				}
+			} else if (hasReview && expanded && details!.reviewText) {
 				const body = details!.reviewText.split("\n");
 				for (const line of body) {
 					lines.push(`  ${line}`);
@@ -436,13 +462,15 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 		},
 	);
 
-	// ─── Reload detection: re-instantiate widgets when session reloads ──────
+	// ─── Reload detection: resume interrupted loops when session reloads ──
 	//
-	// When the user types /reload while ralpi tasks are executing, the old
-	// ExtensionContext is torn down and widgets (created via ctx.ui.setWidget)
-	// disappear. This handler detects the reload, reads the persisted loop-active
-	// marker and progress.json, and re-creates live-status widgets that show
-	// task progress with spinner animation and tool calls from session files.
+	// ralpi runs task agent sessions in-process (createAgentSession), so they
+	// do NOT survive a /reload. When the new session starts, this handler
+	// reads the persisted loop-active marker + progress.json: if any task is
+	// still `in_progress`, the loop was interrupted mid-task and we resume it
+	// (resetting those tasks to pending so the DAG re-schedules them), using
+	// the mode + loop options snapshotted in loop-active.json so the resume is
+	// non-interactive.
 	pi.on("session_start", async (event, ctx) => {
 		if (event.reason !== "reload") return;
 
@@ -455,89 +483,9 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 		if (!loopState) return;
 
 		// Load progress state
-		let abortPolling = false;
 		const progressPath = path.join(projectDir, ".ralpi", "progress.json");
-		const sessionsDir = path.join(projectDir, ".ralpi", "sessions");
 
-		// Parse the task file to get task titles
-		const titleMap = new Map<string, string>();
-		try {
-			const project = parseTaskFile(loopState.taskFile);
-			for (const task of project.tasks) {
-				titleMap.set(task.id, task.title);
-			}
-		} catch {
-			// If parsing fails, just use IDs without titles
-		}
-
-		/** Read recent tool calls from a task's session file. */
-		const readRecentToolCalls = (
-			taskId: string,
-			maxLines = 30,
-		): Array<{ name: string; label: string }> => {
-			try {
-				const files = fs
-					.readdirSync(sessionsDir)
-					.filter((f) => f.startsWith(taskId + "-"))
-					.sort();
-				if (files.length === 0) return [];
-				const sessionPath = path.join(sessionsDir, files[files.length - 1]);
-				const content = fs.readFileSync(sessionPath, "utf-8");
-				const lines = content
-					.split("\n")
-					.filter((l) => l.trim())
-					.slice(-maxLines);
-				const calls: Array<{ name: string; label: string }> = [];
-				for (const line of lines) {
-					try {
-						const event = JSON.parse(line);
-						if (event.type === "tool_execution_start") {
-							calls.push({
-								name: event.toolName,
-								label: formatToolLabel(event.toolName, event.args),
-							});
-						}
-					} catch {
-						// Skip malformed lines
-					}
-				}
-				return calls;
-			} catch {
-				return [];
-			}
-		};
-
-		/**
-		 * Strip control characters and newlines from a display label so it
-		 * does not break TUI layout (tree branches, text width calculation).
-		 */
-		function sanitizeLabel(s: string): string {
-			return s
-				.replace(/\r?\n/g, " ")
-				.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
-				.trim();
-		}
-
-		/** Format a tool call argument into a short label. */
-		function formatToolLabel(name: string, args: unknown): string {
-			const a = args as Record<string, unknown> | undefined;
-			if (!a) return name;
-			if (name === "bash")
-				return sanitizeLabel(String(a.command ?? "").slice(0, 70));
-			if (name === "write" || name === "read" || name === "edit")
-				return sanitizeLabel(String(a.path ?? "").slice(0, 60));
-			if (name === "grep")
-				return sanitizeLabel(
-					`${a.pattern ?? "?"} — ${String(a.path ?? "").slice(0, 40)}`,
-				);
-			if (name === "find")
-				return sanitizeLabel(`${a.path ?? "."} — ${a.glob ?? "*"}`);
-			if (name === "ls")
-				return sanitizeLabel(String(a.path ?? ".").slice(0, 60));
-			return name;
-		}
-
-		/** Re-read progress from disk (old tasks still writing to it). */
+		/** Re-read progress from disk. */
 		const readTasks = (): Record<string, { status: string }> | null => {
 			try {
 				const raw = fs.readFileSync(progressPath, "utf-8");
@@ -548,226 +496,89 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 			}
 		};
 
-		// Early exit: if all tasks already finished during the reload, just clean up
+		// ralpi agent sessions run in-process (createAgentSession), so they do
+		// NOT survive a session reload. Any task left `in_progress` is therefore
+		// stalled — its agent died with the previous session. Detect that state
+		// and actively resume the loop instead of passively polling (which would
+		// spin forever waiting for a dead task to complete).
 		const initialTasks = readTasks();
 		if (initialTasks) {
-			const remaining = Object.values(initialTasks).filter(
-				(t) => t.status === "in_progress",
-			).length;
-			if (remaining === 0) {
-				ctx.ui.notify("All ralpi tasks completed during reload.", "info");
+			const inProgressIds = Object.entries(initialTasks).flatMap(([id, t]) =>
+				t.status === "in_progress" ? [id] : [],
+			);
+
+			if (inProgressIds.length === 0) {
+				// Nothing was mid-flight — loop either finished cleanly between
+				// the reload landing and this handler running, or was stopped
+				// between tasks. Clean up the stale marker and bail.
+				ctx.ui.notify(
+					"ralpi loop has no in-progress task to resume — marking complete.",
+					"info",
+				);
 				deleteLoopActive(projectDir);
 				return;
 			}
-		}
 
-		// Show a status notification for the reconnect
-		const taskCount = loopState.taskIds.length;
-		ctx.ui.notify(
-			`Reconnected to running ralpi execution (${taskCount} tasks, ${loopState.mode} mode)`,
-			"info",
-		);
+			const taskCount = loopState.taskIds.length;
+			ctx.ui.notify(
+				`ralpi loop was interrupted by reload with ${inProgressIds.length} in-progress task(s). ` +
+					`Resuming execution (${taskCount} tasks, ${loopState.mode} mode)...`,
+				"info",
+			);
 
-		// Shared state for the widget
-		let tickCount = 0;
-		const MAX_COLLAPSED = 3;
-
-		if (loopState.mode === "parallel") {
-			// ── Parallel mode: single batch widget ──
-			const widgetKey = `ralpi-parallel-reconnect-${Date.now()}`;
-			let widgetTui: { requestRender(): void } | null = null;
-
-			const buildBatchLines = (t: typeof ctx.ui.theme): string[] => {
-				const tasks = readTasks();
-				if (!tasks) return [t.fg("dim", "(waiting for progress...)")];
-
-				const lines: string[] = [];
-				// Only show tasks that have started (in_progress, completed, failed).
-				// Pending/unstarted tasks are noise after a reload.
-				const sortedIds = [...loopState.taskIds].sort().filter((id) => {
-					const info = tasks[id];
-					return info && info.status !== "pending";
+			// Build the sendProgress wrapper so resumed task messages render the
+			// same expandable tool-call tree as an interactive run.
+			const sendProgress: SendChatMessage = (
+				content: string,
+				meta?: {
+					toolCalls?: Array<{ name: string; label: string }>;
+					reviewText?: string;
+					reviewPath?: string;
+					reviewResult?: ReviewResult;
+				},
+			) => {
+				pi.sendMessage({
+					customType: "ralpi-progress",
+					content,
+					display: true,
+					details: {
+						phase: "progress",
+						toolCalls: meta?.toolCalls,
+						reviewText: meta?.reviewText,
+						reviewPath: meta?.reviewPath,
+						reviewResult: meta?.reviewResult,
+					},
 				});
-
-				// If no tasks have started yet, show nothing — polling will pick up
-				// changes within 500ms.
-				if (sortedIds.length === 0) return [t.fg("dim", "(starting tasks...)")];
-
-				for (const id of sortedIds) {
-					const info = tasks[id]!;
-					const title = titleMap.get(id);
-					const header = title ? `${id} · ${title}` : id;
-
-					// Status icon
-					if (info.status === "completed") {
-						lines.push(`${t.fg("success", "✓")} ${header}`);
-					} else if (info.status === "failed") {
-						lines.push(`${t.fg("error", "✗")} ${header}`);
-					} else if (info.status === "in_progress") {
-						const frame = t.fg(
-							"accent",
-							SPINNER_FRAMES[tickCount % SPINNER_FRAMES.length],
-						);
-						lines.push(`${frame} ${header}`);
-
-						// Show recent tool calls for active tasks
-						const toolCalls = readRecentToolCalls(id);
-						if (toolCalls.length > 0) {
-							if (toolCalls.length <= MAX_COLLAPSED) {
-								for (let i = 0; i < toolCalls.length; i++) {
-									const tc = toolCalls[i];
-									const isLast = i === toolCalls.length - 1;
-									const branch = isLast ? "  └── " : "  ├── ";
-									lines.push(
-										`${branch}${t.fg("accent", `[${tc.name}]`)} ${tc.label}`,
-									);
-								}
-							} else {
-								const shown = toolCalls.slice(-MAX_COLLAPSED);
-								const remaining = toolCalls.length - shown.length;
-								lines.push(t.fg("dim", `  ├── …${remaining} earlier`));
-								for (let i = 0; i < shown.length; i++) {
-									const tc = shown[i];
-									const isLast = i === shown.length - 1;
-									const branch = isLast ? "  └── " : "  ├── ";
-									lines.push(
-										`${branch}${t.fg("accent", `[${tc.name}]`)} ${tc.label}`,
-									);
-								}
-							}
-						}
-					}
-				}
-				return lines;
 			};
 
-			ctx.ui.setWidget(widgetKey, (tui, t) => {
-				widgetTui = tui;
-				return {
-					render: () => buildBatchLines(t),
-					invalidate: () => widgetTui?.requestRender(),
-				};
-			});
+			// Load config from the project directory so model + thinking level
+			// resolve the same way the interactive command handler does.
+			const config = loadConfig(projectDir);
 
-			// 100ms tick: advances spinner frame every tick, refreshes
-			// progress + tool calls every 5 ticks (500ms).
-			const tickTimer = setInterval(() => {
-				if (abortPolling) return;
-				tickCount++;
-				widgetTui?.requestRender();
-
-				if (tickCount % 5 === 0) {
-					const tasks = readTasks();
-					if (!tasks) return;
-					const activeCount = Object.values(tasks).filter(
-						(t) => t.status === "in_progress",
-					).length;
-					if (activeCount === 0) {
-						clearInterval(tickTimer);
-						ctx.ui.setWidget(widgetKey, undefined);
-						deleteLoopActive(projectDir);
-					}
-				}
-			}, 100);
-
-			// Clean up timer when extension is shut down
-			pi.on("session_shutdown", () => {
-				abortPolling = true;
-				clearInterval(tickTimer);
-			});
-		} else {
-			// ── Sequential mode: per-task widget ──
-			const currentTaskId = loopState.taskIds.find((id) => {
-				const tasks = readTasks();
-				return tasks?.[id]?.status === "in_progress";
-			});
-
-			if (currentTaskId) {
-				const widgetKey = `ralpi-task-${currentTaskId}`;
-				let widgetTui: { requestRender(): void } | null = null;
-
-				const buildLines = (t: typeof ctx.ui.theme): string[] => {
-					const tasks = readTasks();
-					const info = tasks?.[currentTaskId];
-					const title = titleMap.get(currentTaskId);
-					const header = title ? `${currentTaskId} · ${title}` : currentTaskId;
-					const lines: string[] = [];
-
-					if (!info || info.status === "pending") {
-						return [t.fg("dim", "(starting task...)")];
-					}
-
-					if (info.status === "completed") {
-						lines.push(`${t.fg("success", "✓")} ${header}`);
-					} else if (info.status === "failed") {
-						lines.push(`${t.fg("error", "✗")} ${header}`);
-					} else if (info.status === "in_progress") {
-						const frame = t.fg(
-							"accent",
-							SPINNER_FRAMES[tickCount % SPINNER_FRAMES.length],
-						);
-						lines.push(`${frame} ${header}`);
-
-						// Show recent tool calls
-						const toolCalls = readRecentToolCalls(currentTaskId);
-						if (toolCalls.length > 0) {
-							const shown = toolCalls.slice(-MAX_COLLAPSED);
-							const remaining = toolCalls.length - shown.length;
-							if (remaining > 0) {
-								lines.push(t.fg("dim", `  ├── …${remaining} earlier`));
-							}
-							for (let i = 0; i < shown.length; i++) {
-								const tc = shown[i];
-								const isLast = i === shown.length - 1;
-								const branch = isLast ? "  └── " : "  ├── ";
-								lines.push(
-									`${branch}${t.fg("accent", `[${tc.name}]`)} ${tc.label}`,
-								);
-							}
-						}
-					}
-					return lines;
-				};
-
-				ctx.ui.setWidget(widgetKey, (tui, t) => {
-					widgetTui = tui;
-					return {
-						render: () => buildLines(t),
-						invalidate: () => widgetTui?.requestRender(),
-					};
-				});
-
-				const tickTimer = setInterval(() => {
-					if (abortPolling) return;
-					tickCount++;
-					widgetTui?.requestRender();
-
-					if (tickCount % 5 === 0) {
-						const tasks = readTasks();
-						if (!tasks) return;
-						const status = tasks[currentTaskId]?.status;
-						if (status !== "in_progress") {
-							clearInterval(tickTimer);
-							// Keep widget visible a moment, then clean up
-							setTimeout(() => {
-								ctx.ui.setWidget(widgetKey, undefined);
-								deleteLoopActive(projectDir);
-							}, 3000);
-						}
-					}
-				}, 100);
-
-				pi.on("session_shutdown", () => {
-					abortPolling = true;
-					clearInterval(tickTimer);
-				});
-			} else {
-				// No task actively in progress — show a "resume" hint
-				ctx.ui.notify(
-					"No running task found. Use /ralpi resume to continue execution.",
-					"warning",
+			try {
+				await resumeLoop(
+					ctx,
+					loopState.taskFile,
+					projectDir,
+					loopState.prdKey,
+					sendProgress,
+					config.model ?? ctx.model,
+					pi.getThinkingLevel(),
+					{
+						mode: loopState.mode,
+						autoCommit: loopState.autoCommit ?? config.execution.autoCommit,
+						autoReview: loopState.autoReview ?? config.execution.autoReview,
+						saveReviews: loopState.saveReviews ?? config.execution.saveReviews,
+						skipFinalStatus: false,
+					},
 				);
+			} catch (error) {
+				const msg = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`ralpi auto-resume failed: ${msg}`, "error");
+				// Leave loop-active.json in place so the user can retry via
+				// /ralpi resume after addressing the underlying error.
 			}
+			return;
 		}
 	});
 
@@ -781,7 +592,7 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 			// Uses "ralpi-progress" customType with a "progress" phase so the
 			// renderer omits the label prefix entirely (no [INFO] etc.).
 			// Accepts an optional meta object with toolCalls for the expandable view,
-			// and reviewText/reviewPath for review messages so the expanded
+			// and reviewText/reviewPath/reviewResult for review messages so the expanded
 			// (Ctrl+O) view can render the full review body without truncation.
 			const sendProgress: SendChatMessage = (
 				content: string,
@@ -789,6 +600,7 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 					toolCalls?: Array<{ name: string; label: string }>;
 					reviewText?: string;
 					reviewPath?: string;
+					reviewResult?: ReviewResult;
 				},
 			) => {
 				pi.sendMessage({
@@ -800,6 +612,7 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 						toolCalls: meta?.toolCalls,
 						reviewText: meta?.reviewText,
 						reviewPath: meta?.reviewPath,
+						reviewResult: meta?.reviewResult,
 					},
 				});
 			};
@@ -997,6 +810,122 @@ async function handleRun(
 
 // ─── /ralpi resume ───────────────────────────────────────────────────────────
 
+/**
+ * Resume core: given a resolved task file, project dir, and PRD key,
+ * build the remaining plan and execute it. Used by both the explicit
+ * `/ralpi resume` command and the auto-resume on session reload.
+ *
+ * `mode` and loop options (`autoCommit`/`autoReview`/`saveReviews`) may be
+ * passed to skip interactive prompts — this is how a reload resumes
+ * non-interactively using the snapshot stored in loop-active.json.
+ * When omitted, the user is prompted as usual.
+ */
+async function resumeLoop(
+	ctx: ExtensionContext,
+	taskFile: string,
+	projectDir: string,
+	prdKey: string | undefined,
+	sendChatMessage: SendChatMessage | undefined,
+	parentModel: unknown,
+	parentThinkingLevel: unknown,
+	options?: {
+		mode?: ExecutionMode;
+		autoCommit?: boolean;
+		autoReview?: boolean;
+		saveReviews?: boolean;
+		skipFinalStatus?: boolean;
+	},
+): Promise<void> {
+	const project = parseTaskFile(taskFile);
+	if (!Array.isArray(project.tasks)) {
+		throw new Error(
+			`Parsed project from ${taskFile} has invalid tasks: expected array, got ${typeof project.tasks}`,
+		);
+	}
+	const config = loadConfig(projectDir);
+	config.model = parentModel ?? ctx.model;
+	config.thinkingLevel = parentThinkingLevel;
+	const progress = new ProgressTracker(projectDir, taskFile, prdKey);
+
+	progress.setPaused(false);
+
+	// Any task left `in_progress` died with the previous session (ralpi runs
+	// agents in-process). Reset them to `pending` so the DAG re-schedules
+	// them cleanly. Without this they'd still be re-run (they're not in the
+	// completed set), but the progress.json would carry a stale in_progress
+	// state during the rebuild window.
+	const resetIds = progress.resetInProgressToPending();
+	if (resetIds.length > 0) {
+		// Keep the source-file checkboxes in sync so a later parse sees these
+		// tasks as `pending` rather than `in_progress`.
+		for (const id of resetIds) {
+			try {
+				updateTaskInFile(taskFile, id, "pending");
+			} catch {
+				// Best-effort — progress.json is the source of truth for scheduling.
+			}
+		}
+		ctx.ui.notify(
+			`Reset stalled in-progress task(s) to pending: ${resetIds.join(", ")}`,
+			"info",
+		);
+	}
+
+	const completed = buildCompletedSet(progress, project);
+	const mode =
+		options?.mode ??
+		(await selectExecutionMode(ctx, project, taskFile, config));
+
+	let autoCommit: boolean;
+	let autoReview: boolean;
+	let saveReviews: boolean;
+	if (
+		options?.autoCommit !== undefined &&
+		options?.autoReview !== undefined &&
+		options?.saveReviews !== undefined
+	) {
+		autoCommit = options.autoCommit;
+		autoReview = options.autoReview;
+		saveReviews = options.saveReviews;
+	} else {
+		const opt = await selectLoopOptions(ctx, config);
+		autoCommit = opt.autoCommit;
+		autoReview = opt.autoReview;
+		saveReviews = opt.saveReviews;
+	}
+	config.execution.autoCommit = autoCommit;
+	config.execution.autoReview = autoReview;
+	config.execution.saveReviews = saveReviews;
+	const plan = buildPlanByMode(mode, project, completed);
+
+	// Print remaining batches before executing
+	const formattedPlan = formatExecutionPlan(plan);
+	if (mode === "parallel") {
+		ctx.ui.notify(`${formattedPlan}\n\nResuming parallel execution...`, "info");
+	} else {
+		ctx.ui.notify(
+			`${formattedPlan}\n\nResuming sequential execution...`,
+			"info",
+		);
+	}
+
+	await executePlanBatches(
+		plan,
+		project,
+		taskFile,
+		config,
+		progress,
+		ctx,
+		mode,
+		sendChatMessage,
+		projectDir,
+	);
+
+	if (!options?.skipFinalStatus) {
+		ctx.ui.notify(formatProgressStatus(progress.getState()), "info");
+	}
+}
+
 async function handleResume(
 	ctx: ExtensionContext,
 	args: string[],
@@ -1042,54 +971,15 @@ async function handleResume(
 		prdKey = selected.prdKey;
 	}
 
-	const project = parseTaskFile(taskFile);
-	if (!Array.isArray(project.tasks)) {
-		throw new Error(
-			`Parsed project from ${taskFile} has invalid tasks: expected array, got ${typeof project.tasks}`,
-		);
-	}
-	const config = loadConfig(projectDir);
-	config.model = parentModel ?? ctx.model;
-	config.thinkingLevel = parentThinkingLevel;
-	const progress = new ProgressTracker(projectDir, taskFile, prdKey);
-
-	progress.setPaused(false);
-
-	const completed = buildCompletedSet(progress, project);
-	const mode = await selectExecutionMode(ctx, project, taskFile, config);
-	const { autoCommit, autoReview, saveReviews } = await selectLoopOptions(
+	await resumeLoop(
 		ctx,
-		config,
-	);
-	config.execution.autoCommit = autoCommit;
-	config.execution.autoReview = autoReview;
-	config.execution.saveReviews = saveReviews;
-	const plan = buildPlanByMode(mode, project, completed);
-
-	// Print remaining batches before executing
-	const formattedPlan = formatExecutionPlan(plan);
-	if (mode === "parallel") {
-		ctx.ui.notify(`${formattedPlan}\n\nResuming parallel execution...`, "info");
-	} else {
-		ctx.ui.notify(
-			`${formattedPlan}\n\nResuming sequential execution...`,
-			"info",
-		);
-	}
-
-	await executePlanBatches(
-		plan,
-		project,
 		taskFile,
-		config,
-		progress,
-		ctx,
-		mode,
-		sendChatMessage,
 		projectDir,
+		prdKey,
+		sendChatMessage,
+		parentModel,
+		parentThinkingLevel,
 	);
-
-	ctx.ui.notify(formatProgressStatus(progress.getState()), "info");
 }
 
 // ─── /ralpi next ─────────────────────────────────────────────────────────────
