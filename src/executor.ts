@@ -26,6 +26,7 @@ import {
 	verdictGlyph,
 	verdictSummary,
 } from "./review";
+import { createWorktree, mergeWorktree, removeWorktree } from "./worktree";
 import {
 	runAgentSession,
 	writeFileSafe,
@@ -388,6 +389,20 @@ export async function runTask(
 /**
  * Execute a batch of tasks (sequentially or in parallel)
  */
+// ─── Worktree Decision ──────────────────────────────────────────────────────
+
+/** Determine if worktree isolation should be used based on config + mode. */
+function shouldUseWorktrees(config: RalpiConfig, isParallel: boolean): boolean {
+	switch (config.execution.worktrees) {
+		case "always":
+			return true;
+		case "parallel":
+			return isParallel;
+		default:
+			return false; // "never"
+	}
+}
+
 export async function executeBatch(
 	tasks: Task[],
 	project: Project,
@@ -443,6 +458,8 @@ export async function executeBatch(
 	const shouldParallel =
 		options?.parallel && tasks.length > 0 && config.execution.maxParallel > 0;
 
+	const useWorktree = shouldUseWorktrees(config, !!shouldParallel);
+
 	if (shouldParallel) {
 		await executeBatchParallel(
 			tasks,
@@ -453,6 +470,7 @@ export async function executeBatch(
 			sendChatMessage,
 			projectDir,
 			roundRobin,
+			useWorktree,
 		);
 		return;
 	}
@@ -468,6 +486,11 @@ export async function executeBatch(
 				ctx,
 				sendChatMessage,
 				projectDir,
+				undefined, // parallelState
+				undefined, // assignedModel
+				undefined, // roundRobin
+				undefined, // batchRender
+				useWorktree,
 			);
 		} catch (error) {
 			// Task failed — stop the batch. Dependent tasks are blocked by
@@ -500,6 +523,7 @@ async function executeBatchParallel(
 	sendChatMessage?: SendChatMessage,
 	projectDir?: string,
 	roundRobin?: ModelRoundRobin | null,
+	useWorktree?: boolean,
 ): Promise<void> {
 	const maxParallel = config.execution.maxParallel;
 	const sharedState: ParallelWidgetState = new Map();
@@ -611,6 +635,7 @@ async function executeBatchParallel(
 				assignedModel,
 				roundRobin,
 				requestBatchRender,
+				useWorktree,
 			)
 				.catch((error) => {
 					// Safety net: one task failure should never crash the batch.
@@ -668,6 +693,7 @@ async function executeTask(
 	assignedModel?: unknown,
 	roundRobin?: ModelRoundRobin | null,
 	batchRender?: () => void,
+	useWorktree?: boolean,
 ): Promise<void> {
 	// Model failover: when a provider/API is down, cycle through available models.
 	// Pi's built-in retry (via SettingsManager) handles transient errors with
@@ -682,6 +708,21 @@ async function executeTask(
 		(msg) => ctx.ui.notify(msg, "warning"),
 	);
 	let currentModel: unknown = assignedModel ?? implModel ?? config.model;
+
+	// ── Worktree isolation ──
+	// When enabled, the task runs in a separate git worktree so parallel tasks
+	// can't stomp each other's files, and review/commit see a clean single-task
+	// diff. `worktreeDir` is used for agent cwd + git ops; `projectDir` stays as
+	// the main repo dir for state saves (reflections, reviews, progress.json).
+	const wt = useWorktree
+		? createWorktree(
+				projectDir,
+				config.paths.stateDir,
+				task.id,
+				progress.getKey(),
+			)
+		: null;
+	const worktreeDir = wt?.dir ?? projectDir;
 
 	while (modelAttempt < maxModelAttempts) {
 		// On subsequent model attempts, advance to the next model.
@@ -714,7 +755,7 @@ async function executeTask(
 				depReflections,
 				ctx,
 				sendChatMessage,
-				projectDir,
+				worktreeDir,
 				parallelState,
 				currentModel,
 				batchRender,
@@ -736,9 +777,9 @@ async function executeTask(
 					let attempt = 0;
 
 					try {
-						while (hasUncommittedChanges(projectDir)) {
-							const status = getGitStatusPorcelain(projectDir);
-							const reviewDiff = getGitDiff(projectDir);
+						while (hasUncommittedChanges(worktreeDir)) {
+							const status = getGitStatusPorcelain(worktreeDir);
+							const reviewDiff = getGitDiff(worktreeDir);
 							if (!reviewDiff && !status) break;
 
 							const reviewPrompt = buildReviewPromptUncommitted(
@@ -761,7 +802,7 @@ async function executeTask(
 									ctx,
 									config,
 									reviewPrompt,
-									projectDir,
+									worktreeDir,
 									`review for ${task.id} · ${task.title}${
 										attempt > 0 ? ` (attempt ${attempt + 1})` : ""
 									}`,
@@ -871,7 +912,7 @@ async function executeTask(
 								depReflections,
 								ctx,
 								sendChatMessage,
-								projectDir,
+								worktreeDir,
 								parallelState,
 								currentModel,
 								batchRender,
@@ -897,12 +938,12 @@ async function executeTask(
 						}
 
 						// ── Commit (after review passes or retries exhausted) ──
-						if (hasUncommittedChanges(projectDir)) {
+						if (hasUncommittedChanges(worktreeDir)) {
 							const commitResult = await runCommitSession(
 								ctx,
 								config,
 								task,
-								projectDir,
+								worktreeDir,
 								currentModel,
 								roundRobin,
 								sendChatMessage,
@@ -927,12 +968,12 @@ async function executeTask(
 				} else if (config.execution.autoCommit) {
 					// ── Commit only (no review) — legacy path ──
 					try {
-						if (hasUncommittedChanges(projectDir)) {
+						if (hasUncommittedChanges(worktreeDir)) {
 							const commitResult = await runCommitSession(
 								ctx,
 								config,
 								task,
-								projectDir,
+								worktreeDir,
 								currentModel,
 								roundRobin,
 								sendChatMessage,
@@ -957,7 +998,7 @@ async function executeTask(
 				} else if (config.execution.autoReview) {
 					// ── Review only (no commit) — reviews latest commit — legacy path ──
 					try {
-						const commitInfo = getLatestCommitDiff(projectDir);
+						const commitInfo = getLatestCommitDiff(worktreeDir);
 						if (commitInfo && commitInfo.diff) {
 							const reviewPrompt = buildReviewPrompt(
 								task,
@@ -980,7 +1021,7 @@ async function executeTask(
 									ctx,
 									config,
 									reviewPrompt,
-									projectDir,
+									worktreeDir,
 									`review for ${task.id} · ${task.title}`,
 									`review-${task.id}`,
 									config.execution.reviewTimeoutMs,
@@ -1057,6 +1098,30 @@ async function executeTask(
 					);
 				}
 
+				// ── Merge worktree back to main ──
+				// After the commit lands on the worktree branch, merge it into the
+				// main repo so downstream tasks see the changes. On conflict, the task
+				// is marked failed and the worktree is retained for inspection.
+				if (wt) {
+					const mergeResult = mergeWorktree(projectDir, wt.branch, task.id);
+					if (!mergeResult.success) {
+						sendChatMessage?.(
+							`✗ ${task.id} · ${task.title} — merge conflict, worktree retained at ${wt.dir}\n  ${mergeResult.message}`,
+						);
+						progress.markFailed(task.id, mergeResult.message);
+						try {
+							updateTaskInFile(project.sourcePath, task.id, "failed");
+						} catch {
+							// Best-effort
+						}
+						roundRobin?.release(task.id);
+						return;
+					}
+					// Merge succeeded — clean up the worktree.
+					removeWorktree(projectDir, wt);
+					sendChatMessage?.(`✓ merged worktree for ${task.id} into main`);
+				}
+
 				// Mark completed with all metadata
 				progress.markCompleted(
 					task.id,
@@ -1103,6 +1168,7 @@ async function executeTask(
 				}`,
 				"error",
 			);
+			if (wt) removeWorktree(projectDir, wt);
 			roundRobin?.release(task.id);
 			return;
 		} catch (error) {
@@ -1118,6 +1184,7 @@ async function executeTask(
 			}
 			sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${errorMsg}`);
 			ctx.ui.notify(`Task ${task.id} failed: ${errorMsg}`, "error");
+			if (wt) removeWorktree(projectDir, wt);
 			return;
 		}
 	}
@@ -1133,6 +1200,7 @@ async function executeTask(
 		`Task ${task.id} failed: all configured models exhausted`,
 		"error",
 	);
+	if (wt) removeWorktree(projectDir, wt);
 }
 
 // ─── Save Reflection to File ────────────────────────────────────────────────

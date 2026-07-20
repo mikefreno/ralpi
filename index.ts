@@ -18,6 +18,7 @@ import { formatReflections } from "./src/reflection";
 import { verdictGlyph, verdictSummary, formatFindings } from "./src/review";
 import type { ReviewResult } from "./src/types";
 import { executeBatch, type SendChatMessage } from "./src/executor";
+import { cleanupStaleWorktrees } from "./src/worktree";
 import {
 	loadConfig,
 	resolveTaskArg,
@@ -256,6 +257,17 @@ async function executePlanBatches(
 			autoReview: config.execution.autoReview,
 			saveReviews: config.execution.saveReviews,
 		});
+
+		// Clean up stale worktrees from interrupted runs before starting.
+		if (config.execution.worktrees !== "never" && projectDir) {
+			const removed = cleanupStaleWorktrees(projectDir, progress.getKey());
+			if (removed.length > 0) {
+				ctx.ui.notify(
+					`Cleaned up ${removed.length} stale worktree(s) from previous run.`,
+					"info",
+				);
+			}
+		}
 	}
 
 	// Track failed task IDs across batches to block downstream tasks

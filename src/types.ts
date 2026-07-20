@@ -238,6 +238,12 @@ export interface RalpiConfig {
 		reviewBlockOnFail: boolean;
 		/** Maximum total duration for the entire loop execution in milliseconds (0 = no limit). Checked between batches — in-progress tasks finish naturally. */
 		loopTimeoutMs: number;
+		/** Isolate each task in a separate git worktree so parallel tasks can't
+		 *  stomp each other's files, and review/commit see a clean single-task diff.
+		 *  - "never":   all tasks run in the shared working tree (default, backward compat)
+		 *  - "parallel": only when maxParallel > 1 and mode is parallel
+		 *  - "always":  every task gets its own worktree */
+		worktrees: "always" | "parallel" | "never";
 	};
 	prompts: {
 		/** Additional context injected into every task prompt */
@@ -272,6 +278,7 @@ export const DEFAULT_CONFIG: RalpiConfig = {
 		maxReviewRetries: 2, // 2 re-execution attempts on review rejection before giving up
 		reviewBlockOnFail: false, // false = commit anyway after retries exhausted
 		loopTimeoutMs: 0, // 0 = no limit
+		worktrees: "never", // worktree isolation per task
 	},
 	prompts: {
 		projectContext: "",
