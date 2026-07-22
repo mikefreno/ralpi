@@ -123,10 +123,10 @@ function buildPlanByMode(
 
 /**
  * Prompt the user to select auto-review and auto-commit options for this loop.
- * Reviews are asked about FIRST, then commits — so the user can opt into a
- * review gate (review changes, loop on fail) and decide whether a passing
- * review should commit. Fields explicitly set in the config YAML are
- * skipped (no prompt).
+ * Reviews are asked about FIRST. When autoReview is on, commit is always
+ * mandated (it happens before review) — so autoCommit is forced true and not
+ * asked about. When autoReview is off, autoCommit is asked as a stand-alone
+ * toggle. Fields explicitly set in the config YAML are skipped (no prompt).
  * Returns the selected options (or config defaults if cancelled).
  */
 async function selectLoopOptions(
@@ -136,17 +136,16 @@ async function selectLoopOptions(
 	const explicit = config.execution.explicitKeys;
 
 	// ── 1. Auto-review (asked FIRST) ──
-	// When enabled, a review gate runs BEFORE the commit: uncommitted changes
-	// are reviewed, and on a "fail" verdict the task is re-executed with the
-	// review feedback injected (looping until pass or maxReviewRetries is
-	// exhausted). Only then does the commit session run (when autoCommit is
-	// also enabled).
+	// When enabled, a commit is mandated before review (the task agent's
+	// changes are committed, then the complete diff is reviewed). On 'fail'
+	// the task is re-executed with review feedback (looping until pass or
+	// maxReviewRetries exhausted). On pass the worktree merges.
 	let autoReview: boolean;
 	if (explicit?.has("autoReview")) {
 		autoReview = config.execution.autoReview;
 	} else {
 		const reviewChoice = await ctx.ui.select("Auto-review after each task?", [
-			"Yes — review changes and loop on failures (re-execute until pass)",
+			"Yes — review the task commit and loop on failures (re-execute until pass)",
 			"No — skip review",
 		]);
 		autoReview = reviewChoice
@@ -173,24 +172,15 @@ async function selectLoopOptions(
 		}
 	}
 
-	// ── 3. Auto-commit (asked AFTER review) ──
-	// When review is enabled, this gates whether the changes are committed
-	// after a passing review (or after retries exhaust). When review is
-	// disabled, this is a stand-alone "commit per task" toggle.
+	// ── 3. Auto-commit ──
+	// When autoReview is on, commit is always mandated (it happens before the
+	// review). autoCommit is forced true and not asked about. When review is
+	// disabled, autoCommit is asked as a stand-alone "commit per task" toggle.
 	let autoCommit: boolean;
-	if (explicit?.has("autoCommit")) {
+	if (autoReview) {
+		autoCommit = true; // mandated by the review-gated flow
+	} else if (explicit?.has("autoCommit")) {
 		autoCommit = config.execution.autoCommit;
-	} else if (autoReview) {
-		const commitChoice = await ctx.ui.select(
-			"Auto-commit after a passing review?",
-			[
-				"Yes — commit changes once the review passes",
-				"No — leave changes uncommitted after review",
-			],
-		);
-		autoCommit = commitChoice
-			? commitChoice.startsWith("Yes")
-			: config.execution.autoCommit;
 	} else {
 		const commitChoice = await ctx.ui.select("Auto-commit after each task?", [
 			"Yes — stage and commit changes automatically",

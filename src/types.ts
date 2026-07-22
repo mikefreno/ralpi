@@ -211,12 +211,13 @@ export interface RalpiConfig {
 		models: string[];
 		/** Spawn a follow-up agent to commit changes after each task completes */
 		autoCommit: boolean;
-		/** Spawn a review agent to review uncommitted changes against the
-		 *  task description BEFORE committing. On a 'fail' verdict the task is
-		 *  re-executed with the review feedback injected (loops until pass or
-		 *  maxReviewRetries is exhausted). When autoCommit is also enabled, the
-		 *  commit runs after the review passes (or retries exhaust); otherwise
-		 *  changes are left uncommitted. */
+		/** Spawn a review agent to review the task's committed changes against
+		 *  the task description. When autoReview is on, commit is mandated:
+		 *  changes are committed (via commit session fallback when the agent
+		 *  didn't self-commit), then the COMPLETE diff (baseRef..HEAD) is
+		 *  reviewed. On 'fail' the task is re-executed with feedback (loops
+		 *  until pass or maxReviewRetries). On pass the worktree merges.
+		 *  When autoReview is off, autoCommit controls standalone commit. */
 		autoReview: boolean;
 		/** Persist the full review output to `.ralpi/reviews/<task-id>.md`.
 		 *  Only active when autoReview is true and the user opts in at loop start. */
@@ -236,13 +237,12 @@ export interface RalpiConfig {
 		reviewTimeoutMs: number;
 		/** Max review-fix re-execution attempts before giving up (0 = no retries;
 		 *  review runs once, reject = stop). Active whenever autoReview is
-		 *  enabled. On exhaustion: if autoCommit is enabled, the changes are
-		 *  committed anyway; if reviewBlockOnFail is set, the task is marked
-		 *  failed instead of committing. */
+		 *  enabled. On exhaustion the task proceeds with its committed changes
+		 *  (the worktree merges) unless reviewBlockOnFail is set. */
 		maxReviewRetries: number;
 		/** When true, a 'fail' review verdict after exhausting maxReviewRetries
-		 *  marks the task as failed instead of leaving changes (committing when
-		 *  autoCommit, or leaving uncommitted otherwise). */
+		 *  marks the task as failed instead of proceeding with its committed
+		 *  changes (the worktree does not merge). */
 		reviewBlockOnFail: boolean;
 		/** Maximum total duration for the entire loop execution in milliseconds (0 = no limit). Checked between batches — in-progress tasks finish naturally. */
 		loopTimeoutMs: number;

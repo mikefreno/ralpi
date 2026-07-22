@@ -120,8 +120,8 @@ execution:
   models:                 # round-robin in <provider>/<model> format
     - google/gemini-3.5-flash # 1st and 3rd task in parallel
     - openai/gpt-5.5 # 2nd task in parallel
-  autoCommit: true        # commit changes after each task passes review (or when autoReview is off)
-  autoReview: false        # review changes BEFORE commit; loop on fail, commit on pass
+  autoCommit: true        # commit after each task (mandated when autoReview is on; standalone toggle when off)
+  autoReview: false        # commit → review → loop on fail → merge on pass
   implModel: ""           # model for task impl (sequential mode, empty = inherit parent)
   commitModel: ""         # model for commit sessions (empty = inherit task model)
   reviewModel: ""         # model for review sessions (empty = inherit task model)
@@ -145,15 +145,17 @@ prompts:
 
 #### Auto-review and Auto-commit
 
-At loop startup the review question is asked FIRST, then the commit
-question. When `autoReview` is enabled, a review gate runs BEFORE the
-commit: each task's uncommitted changes are reviewed against the task
-description, and on a `fail` verdict the task is re-executed with the
-review feedback injected into the prompt (looping until the review
-passes or `maxReviewRetries` is exhausted). When `autoCommit` is also
-enabled, a follow-up agent stages and commits the changes once the
-review passes (or after retries exhaust); otherwise the changes are
-left uncommitted for manual inspection.
+At loop startup the review question is asked FIRST. When `autoReview` is
+enabled, commit is **mandated** — after task execution, changes are
+committed (via a commit agent session when the task agent didn't
+self-commit), then the complete task diff (`baseRef..HEAD`) is reviewed
+against the task description. On a `fail` verdict the task is
+re-executed with the review feedback injected into the prompt (looping
+until the review passes or `maxReviewRetries` is exhausted). After
+re-execution, changes are committed again and the full diff is
+re-reviewed with the same base ref so the reviewer sees the complete
+state — original work plus fixes. On pass, the changes are already
+committed and the worktree merges.
 
 When `autoReview` is disabled, `autoCommit` runs a follow-up commit
 agent after each task with no review. Both options can be overridden at

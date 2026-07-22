@@ -15,7 +15,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	buildTaskPrompt,
-	buildReviewPromptUncommitted,
+	buildReviewPrompt,
 	buildConflictResolutionPrompt,
 	MAX_DIFF_BYTES,
 } from "./prompts";
@@ -42,6 +42,8 @@ import {
 	writeFileSafe,
 	ensureDir,
 	captureGitCommits,
+	captureGitHead,
+	getCommitRangeDiff,
 	hasUncommittedChanges,
 	getGitStatusPorcelain,
 	getGitDiff,
@@ -805,6 +807,12 @@ async function executeTask(
 				task.dependencies || [],
 			);
 
+			// Capture base HEAD before execution so the review-gated loop can diff
+			// the complete task output (baseRef..HEAD) across execution + fix attempts.
+			const baseRef = config.execution.autoReview
+				? captureGitHead(worktreeDir)
+				: undefined;
+
 			// Run the task
 			const result = await runTask(
 				task,
@@ -826,26 +834,57 @@ async function executeTask(
 				let reviewRetries = 0;
 
 				if (config.execution.autoReview) {
-					// ── Review-gated loop: review FIRST, re-execute on reject, commit on pass ──
-					// The review examines uncommitted changes. If the verdict is "fail",
-					// the task is re-executed with the review feedback injected into the
-					// prompt (up to maxReviewRetries). On pass (or after retries exhaust)
-					// the commit session runs when autoCommit is also enabled — otherwise
-					// the changes are left uncommitted for manual inspection.
+					// ── Review-gated loop: commit → review → re-execute on fail → merge on pass ──
+					// The commit is mandated — when the task agent didn't self-commit, a
+					// commit session handles it. Then the COMPLETE task diff (baseRef..HEAD)
+					// is reviewed. On 'fail' the task is re-executed with the review feedback
+					// injected (up to maxReviewRetries); after re-execution changes are
+					// committed again and the full diff is re-reviewed with the SAME baseRef
+					// so the reviewer sees the complete state, not just incremental fixes.
+					// On pass the changes are already committed — the worktree merges next.
 					const maxRetries = config.execution.maxReviewRetries;
 					let attempt = 0;
 
 					try {
-						while (hasUncommittedChanges(worktreeDir)) {
-							const status = getGitStatusPorcelain(worktreeDir);
-							const reviewDiff = getGitDiff(worktreeDir);
-							if (!reviewDiff && !status) break;
+						// ── Ensure committed (commit session fallback) ──
+						// If the task agent didn't self-commit, a commit session handles it.
+						if (hasUncommittedChanges(worktreeDir)) {
+							const commitResult = await runCommitSession(
+								ctx,
+								config,
+								task,
+								worktreeDir,
+								currentModel,
+								roundRobin,
+								sendChatMessage,
+							);
+							if (commitResult.success) {
+								finalCommitMessages = [
+									...finalCommitMessages,
+									...commitResult.commitMessages,
+								];
+								finalCommitSummary = finalCommitSummary
+									? `${finalCommitSummary}; ${commitResult.commitSummary}`
+									: commitResult.commitSummary;
+							}
+						}
 
-							const reviewPrompt = buildReviewPromptUncommitted(
+						// ── Review loop ──
+						// baseRef was captured before runTask (above). Each review iteration
+						// diffs the range baseRef..HEAD — the complete task output including
+						// all fix attempts. On re-execution the same baseRef is reused.
+						while (true) {
+							const reviewInfo = baseRef
+								? getCommitRangeDiff(worktreeDir, baseRef)
+								: null;
+							if (!reviewInfo || !reviewInfo.diff) break; // nothing to review
+
+							const reviewPrompt = buildReviewPrompt(
 								task,
 								project,
-								status,
-								reviewDiff,
+								reviewInfo.hash,
+								reviewInfo.subject,
+								reviewInfo.diff,
 								config.prompts.projectContext,
 							);
 
@@ -875,11 +914,15 @@ async function executeTask(
 									`~ review for ${task.id} · ${task.title} — review session failed: ${reviewResult.error}`,
 									{ toolCalls: reviewToolCalls },
 								);
-								break; // commit on autoCommit, otherwise leave uncommitted
+								break; // proceed with what we have (changes already committed)
 							}
 
 							const reviewText = reviewResult.text.trim();
-							const review = extractReview(reviewText, task.id, "uncommitted");
+							const review = extractReview(
+								reviewText,
+								task.id,
+								reviewInfo.hash,
+							);
 							finalReview = review ?? undefined;
 
 							// Persist structured review JSON when opted in.
@@ -897,7 +940,7 @@ async function executeTask(
 								review &&
 								(review.verdict === "pass" || review.verdict === "warn")
 							) {
-								// Review passed — proceed to commit.
+								// Review passed — all changes are committed; merge will follow.
 								const label = `${verdictGlyph(review.verdict)} ${verdictSummary(review)}`;
 								const savedHint = reviewPath ? ` · saved to ${reviewPath}` : "";
 								sendChatMessage?.(
@@ -909,7 +952,7 @@ async function executeTask(
 										reviewResult: review,
 									},
 								);
-								break; // good to commit
+								break; // good to merge
 							}
 
 							// Review rejected (fail) or verdict not parsed.
@@ -934,7 +977,7 @@ async function executeTask(
 							}
 
 							if (attempt >= maxRetries) {
-								// Retries exhausted.
+								// Retries exhausted — changes are already committed; proceed.
 								if (config.execution.reviewBlockOnFail) {
 									sendChatMessage?.(
 										`✗ ${task.id} · ${task.title} — review rejected after ${maxRetries} retr${maxRetries === 1 ? "y" : "ies"} (reviewBlockOnFail)`,
@@ -952,11 +995,9 @@ async function executeTask(
 									return;
 								}
 								sendChatMessage?.(
-									config.execution.autoCommit
-										? `~ review for ${task.id} · ${task.title} — max retries (${maxRetries}) exhausted, committing anyway`
-										: `~ review for ${task.id} · ${task.title} — max retries (${maxRetries}) exhausted, leaving changes as-is`,
+									`~ review for ${task.id} · ${task.title} — max retries (${maxRetries}) exhausted, proceeding with current state`,
 								);
-								break; // commit on autoCommit, otherwise leave uncommitted
+								break; // changes already committed — merge proceeds
 							}
 
 							attempt++;
@@ -984,7 +1025,7 @@ async function executeTask(
 								sendChatMessage?.(
 									`~ re-execution for ${task.id} · ${task.title} failed: ${fixResult.error}`,
 								);
-								break; // commit what we have
+								break; // proceed with what we have
 							}
 
 							// Merge commit messages from the fix attempt.
@@ -995,34 +1036,30 @@ async function executeTask(
 							finalCommitSummary = finalCommitSummary
 								? `${finalCommitSummary}; ${fixResult.commitSummary ?? ""}`
 								: (fixResult.commitSummary ?? "");
-							// Loop back to review the updated changes.
-						}
 
-						// ── Commit (after review passes or retries exhausted) ──
-						// Only commit when autoCommit is enabled; review-only mode leaves
-						// changes uncommitted so the user can inspect them manually.
-						if (
-							config.execution.autoCommit &&
-							hasUncommittedChanges(worktreeDir)
-						) {
-							const commitResult = await runCommitSession(
-								ctx,
-								config,
-								task,
-								worktreeDir,
-								currentModel,
-								roundRobin,
-								sendChatMessage,
-							);
-							if (commitResult.success) {
-								finalCommitMessages = [
-									...finalCommitMessages,
-									...commitResult.commitMessages,
-								];
-								finalCommitSummary = finalCommitSummary
-									? `${finalCommitSummary}; ${commitResult.commitSummary}`
-									: commitResult.commitSummary;
+							// Ensure committed after re-execution (same commit fallback).
+							if (hasUncommittedChanges(worktreeDir)) {
+								const commitResult = await runCommitSession(
+									ctx,
+									config,
+									task,
+									worktreeDir,
+									currentModel,
+									roundRobin,
+									sendChatMessage,
+								);
+								if (commitResult.success) {
+									finalCommitMessages = [
+										...finalCommitMessages,
+										...commitResult.commitMessages,
+									];
+									finalCommitSummary = finalCommitSummary
+										? `${finalCommitSummary}; ${commitResult.commitSummary}`
+										: commitResult.commitSummary;
+								}
 							}
+							// Loop back to review with the same baseRef — the reviewer sees the
+							// complete diff (original work + fixes), not just incremental changes.
 						}
 					} catch (error) {
 						sendChatMessage?.(

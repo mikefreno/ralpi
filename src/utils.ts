@@ -807,3 +807,76 @@ export function getLatestCommitDiff(
 		return null;
 	}
 }
+
+/**
+ * Capture the current HEAD commit SHA. Returns the full 40-char SHA, or
+ * undefined when not a git repo / git unavailable. Used to snapshot the
+ * worktree HEAD before a task runs so the review can diff the complete task
+ * output (baseRef..HEAD) — including any commits the task agent makes.
+ */
+export function captureGitHead(projectDir: string): string | undefined {
+	const { execSync } = require("node:child_process");
+	try {
+		const sha = execSync("git rev-parse HEAD", {
+			cwd: projectDir,
+			encoding: "utf-8",
+			stdio: ["pipe", "pipe", "pipe"],
+		}).trim();
+		// Guard against injection — only accept hex SHAs.
+		return /^[0-9a-f]{7,40}$/i.test(sha) ? sha : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Get the diff from `baseRef` to HEAD — the complete set of committed changes
+ * made since the base reference. Used by the review-gated loop so the reviewer
+ * sees the full task diff (all commits, not just the latest) across execution
+ * attempts and re-execution fixes. `baseRef` must be a validated hex SHA from
+ * captureGitHead(). Returns the short HEAD hash, HEAD subject, and range diff,
+ * or null when git is unavailable / baseRef is invalid / no changes exist.
+ */
+export function getCommitRangeDiff(
+	projectDir: string,
+	baseRef: string,
+): { hash: string; subject: string; diff: string } | null {
+	const { execSync } = require("node:child_process");
+
+	// Only pass validated hex SHAs to the shell.
+	if (!/^[0-9a-f]{7,40}$/i.test(baseRef)) return null;
+
+	try {
+		execSync("git rev-parse --git-dir", {
+			cwd: projectDir,
+			stdio: "pipe",
+		});
+	} catch {
+		return null;
+	}
+
+	try {
+		const hash = execSync("git rev-parse --short HEAD", {
+			cwd: projectDir,
+			encoding: "utf-8",
+		}).trim();
+
+		const subject = execSync("git log -1 --format=%s", {
+			cwd: projectDir,
+			encoding: "utf-8",
+		}).trim();
+
+		// Diff from baseRef to HEAD — shows all committed changes made since
+		// the snapshot. Includes stat overview + full patch.
+		const diff = execSync(`git diff ${baseRef} HEAD --stat --patch`, {
+			cwd: projectDir,
+			encoding: "utf-8",
+			maxBuffer: 1024 * 1024,
+		}).trim();
+
+		if (!diff) return null; // no changes since baseRef
+		return { hash, subject, diff };
+	} catch {
+		return null;
+	}
+}
