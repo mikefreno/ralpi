@@ -778,6 +778,8 @@ async function executeTask(
 				config.paths.stateDir,
 				task.id,
 				progress.getKey(),
+				undefined,
+				task.title,
 			)
 		: null;
 	const worktreeDir = wt?.dir ?? projectDir;

@@ -6,7 +6,7 @@ import { ensureDir } from "./utils";
 export interface WorktreeHandle {
 	/** Absolute path to the worktree working directory. */
 	dir: string;
-	/** Branch name: `ralpi/<prdKey>/<taskId>`. */
+	/** Branch name: slugified task title, or `ralpi/<prdKey>/<taskId>` as a fallback. */
 	branch: string;
 	/** Main repo directory (where the primary working tree lives). */
 	mainDir: string;
@@ -109,11 +109,35 @@ function safeBranchSuffix(taskId: string): string {
 }
 
 /**
+ * Sanitise a free-form task title into a git-branch-safe slug.
+ *
+ * Lowercases, replaces runs of non-alphanumeric characters with single
+ * hyphens, trims leading/trailing hyphens, and caps the length so the
+ * branch name stays readable and within reasonable git limits.
+ *
+ * Returns an empty string when the title produces no usable slug.
+ */
+function slugifyTitle(title: string): string {
+	return title
+		.trim()
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 60);
+}
+
+/**
  * Create a git worktree for a task.
  *
  * The worktree is created at `<mainDir>/.ralpi/worktrees/<taskId>` on a new
- * branch `ralpi/<prdKey>/<taskId>`, based at `baseRef` (defaults to the
- * current HEAD of `mainDir`).
+ * branch. When `taskTitle` is provided the branch name is the slugified title
+ * alone (e.g. `fix-plans-tab-grammar-casing-icons`); otherwise it falls back
+ * to `ralpi/<prdKey>/<taskId>`. Based at `baseRef` (defaults to the current
+ * HEAD of `mainDir`).
+ *
+ * The worktree directory always uses the bare `taskId` for a stable path;
+ * stale-worktree cleanup identifies ralpi worktrees by that path, not by
+ * branch name, so descriptive branch names are safe.
  *
  * Returns null if `mainDir` is not a git repo or the worktree creation fails.
  */
@@ -123,6 +147,7 @@ export function createWorktree(
 	taskId: string,
 	prdKey: string,
 	baseRef?: string,
+	taskTitle?: string,
 ): WorktreeHandle | null {
 	if (!isGitRepo(mainDir)) return null;
 
@@ -130,7 +155,8 @@ export function createWorktree(
 	if (!ref) return null;
 
 	const safeId = safeBranchSuffix(taskId);
-	const branch = `ralpi/${prdKey}/${safeId}`;
+	const slug = taskTitle ? slugifyTitle(taskTitle) : "";
+	const branch = slug || `ralpi/${prdKey}/${safeId}`;
 	const wtDir = worktreePath(mainDir, stateDir, taskId);
 
 	// Ensure the parent directory exists so `git worktree add` can create
@@ -271,13 +297,14 @@ export function removeWorktree(mainDir: string, wt: WorktreeHandle): void {
 /**
  * Clean up stale worktrees from interrupted runs.
  *
- * Lists all worktrees whose branches start with `ralpi/<prdKey>/` and
- * removes them. Called at the start of a loop to ensure a clean slate.
- * Returns the list of removed worktree directories.
+ * Identifies ralpi-owned worktrees by their path living under
+ * `<mainDir>/<stateDir>/worktrees/` and removes them. Called at the start
+ * of a loop to ensure a clean slate. Returns the list of removed worktree
+ * directories.
  */
 export function cleanupStaleWorktrees(
 	mainDir: string,
-	prdKey: string,
+	stateDir: string,
 ): string[] {
 	const removed: string[] = [];
 
@@ -286,6 +313,9 @@ export function cleanupStaleWorktrees(
 
 	const list = git("worktree list --porcelain", mainDir);
 	if (!list) return removed;
+
+	// Worktrees we manage live under <mainDir>/<stateDir>/worktrees/.
+	const managedRoot = path.resolve(mainDir, stateDir, "worktrees");
 
 	// Parse worktree list: each entry is `worktree <path>` followed by metadata.
 	const wtLines = list
@@ -297,14 +327,18 @@ export function cleanupStaleWorktrees(
 		// Skip the main working tree (always first in the list).
 		if (path.resolve(wtDir) === path.resolve(mainDir)) continue;
 
-		// Check if this worktree is on a ralpi branch for this PRD.
-		const branch = git(`rev-parse --abbrev-ref HEAD`, wtDir);
-		if (!branch) continue;
-		if (!branch.startsWith(`ralpi/${prdKey}/`)) continue;
+		// Only touch worktrees that live under the ralpi worktrees directory.
+		const resolved = path.resolve(wtDir);
+		if (
+			resolved !== managedRoot &&
+			!resolved.startsWith(managedRoot + path.sep)
+		)
+			continue;
 
 		// Remove the worktree and its branch.
 		git(`worktree remove --force "${wtDir}"`, mainDir);
-		if (branch !== "HEAD" && branch !== "detached") {
+		const branch = git(`rev-parse --abbrev-ref HEAD`, wtDir);
+		if (branch && branch !== "HEAD" && branch !== "detached") {
 			git(`branch -D "${branch}"`, mainDir);
 		}
 		removed.push(wtDir);
