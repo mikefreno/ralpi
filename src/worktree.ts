@@ -86,17 +86,19 @@ export function getCurrentBranch(dir: string): string | null {
 
 /**
  * Path to the worktree directory for a given task.
- * Lives inside `.ralpi/worktrees/<taskId>` in the main repo so all ralpi
- * state stays co-located. The directory itself is untracked git metadata
- * (registered in `.git/worktrees/`), so it won't pollute `git status`
- * in the main working tree.
+ * Lives inside `.ralpi/worktrees/<prdKey>/<taskId>` in the main repo so all
+ * ralpi state stays co-located and multiple loops (different PRDs) can run
+ * concurrently without colliding on shared task IDs. The directory itself
+ * is untracked git metadata (registered in `.git/worktrees/`), so it won't
+ * pollute `git status` in the main working tree.
  */
 export function worktreePath(
 	mainDir: string,
 	stateDir: string,
+	prdKey: string,
 	taskId: string,
 ): string {
-	return path.join(mainDir, stateDir, "worktrees", taskId);
+	return path.join(mainDir, stateDir, "worktrees", prdKey, taskId);
 }
 
 /**
@@ -129,8 +131,8 @@ function slugifyTitle(title: string): string {
 /**
  * Create a git worktree for a task.
  *
- * The worktree is created at `<mainDir>/.ralpi/worktrees/<taskId>` on a new
- * branch. When `taskTitle` is provided the branch name is the slugified title
+ * The worktree is created at `<mainDir>/.ralpi/worktrees/<prdKey>/<taskId>`
+ * on a new branch. When `taskTitle` is provided the branch name is the slugified title
  * alone (e.g. `fix-plans-tab-grammar-casing-icons`); otherwise it falls back
  * to `ralpi/<prdKey>/<taskId>`. Based at `baseRef` (defaults to the current
  * HEAD of `mainDir`).
@@ -157,7 +159,7 @@ export function createWorktree(
 	const safeId = safeBranchSuffix(taskId);
 	const slug = taskTitle ? slugifyTitle(taskTitle) : "";
 	const branch = slug || `ralpi/${prdKey}/${safeId}`;
-	const wtDir = worktreePath(mainDir, stateDir, taskId);
+	const wtDir = worktreePath(mainDir, stateDir, prdKey, taskId);
 
 	// Ensure the parent directory exists so `git worktree add` can create
 	// the worktree directory inside it.
@@ -301,10 +303,16 @@ export function removeWorktree(mainDir: string, wt: WorktreeHandle): void {
  * `<mainDir>/<stateDir>/worktrees/` and removes them. Called at the start
  * of a loop to ensure a clean slate. Returns the list of removed worktree
  * directories.
+ *
+ * When `prdKey` is provided, cleanup is scoped to
+ * `<mainDir>/<stateDir>/worktrees/<prdKey>/` so that worktrees belonging to
+ * other concurrently running loops (different PRDs) are left untouched.
+ * When omitted, all ralpi-managed worktrees are cleaned.
  */
 export function cleanupStaleWorktrees(
 	mainDir: string,
 	stateDir: string,
+	prdKey?: string,
 ): string[] {
 	const removed: string[] = [];
 
@@ -315,7 +323,14 @@ export function cleanupStaleWorktrees(
 	if (!list) return removed;
 
 	// Worktrees we manage live under <mainDir>/<stateDir>/worktrees/.
-	const managedRoot = path.resolve(mainDir, stateDir, "worktrees");
+	// When a prdKey is given, narrow to that PRD's subdir so concurrent
+	// loops (other PRDs) are not disturbed.
+	const managedRoot = path.resolve(
+		mainDir,
+		stateDir,
+		"worktrees",
+		...(prdKey ? [prdKey] : []),
+	);
 
 	// Parse worktree list: each entry is `worktree <path>` followed by metadata.
 	const wtLines = list

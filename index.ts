@@ -260,7 +260,11 @@ async function executePlanBatches(
 
 		// Clean up stale worktrees from interrupted runs before starting.
 		if (config.execution.worktrees !== "never" && projectDir) {
-			const removed = cleanupStaleWorktrees(projectDir, config.paths.stateDir);
+			const removed = cleanupStaleWorktrees(
+				projectDir,
+				config.paths.stateDir,
+				progress.getKey(),
+			);
 			if (removed.length > 0) {
 				ctx.ui.notify(
 					`Cleaned up ${removed.length} stale worktree(s) from previous run.`,
