@@ -120,8 +120,8 @@ execution:
   models:                 # round-robin in <provider>/<model> format
     - google/gemini-3.5-flash # 1st and 3rd task in parallel
     - openai/gpt-5.5 # 2nd task in parallel
-  autoCommit: true        # spawn a commit agent after each task completes
-  autoReview: false        # spawn a review agent to review each commit
+  autoCommit: true        # commit changes after each task passes review (or when autoReview is off)
+  autoReview: false        # review changes BEFORE commit; loop on fail, commit on pass
   implModel: ""           # model for task impl (sequential mode, empty = inherit parent)
   commitModel: ""         # model for commit sessions (empty = inherit task model)
   reviewModel: ""         # model for review sessions (empty = inherit task model)
@@ -143,13 +143,22 @@ prompts:
 > **NOTE**: this is only used in parallel execution, in sequential mode the
 > parent pi session's model is used
 
-#### Auto-commit and Auto-review
+#### Auto-review and Auto-commit
 
-When `autoCommit` is enabled (default), a follow-up agent session is spawned
-after each task to stage and commit uncommitted changes. When `autoReview` is
-enabled, a second follow-up session reviews the latest commit against the task
-description. Both options can be overridden at loop startup via a selection
-prompt.
+At loop startup the review question is asked FIRST, then the commit
+question. When `autoReview` is enabled, a review gate runs BEFORE the
+commit: each task's uncommitted changes are reviewed against the task
+description, and on a `fail` verdict the task is re-executed with the
+review feedback injected into the prompt (looping until the review
+passes or `maxReviewRetries` is exhausted). When `autoCommit` is also
+enabled, a follow-up agent stages and commits the changes once the
+review passes (or after retries exhaust); otherwise the changes are
+left uncommitted for manual inspection.
+
+When `autoReview` is disabled, `autoCommit` runs a follow-up commit
+agent after each task with no review. Both options can be overridden at
+loop startup via a selection prompt (config YAML values are honored
+without prompting when set explicitly).
 
 `commitModel` and `reviewModel` accept `<provider>/<model>` strings (e.g.
 `anthropic/claude-sonnet-4`) resolved via the model registry. When empty, the

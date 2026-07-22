@@ -122,9 +122,11 @@ function buildPlanByMode(
 }
 
 /**
- * Prompt the user to select auto-commit and auto-review options for this loop.
- * Defaults are taken from config; the user can override at loop startup.
- * Fields explicitly set in the config YAML are skipped (no prompt).
+ * Prompt the user to select auto-review and auto-commit options for this loop.
+ * Reviews are asked about FIRST, then commits — so the user can opt into a
+ * review gate (review changes, loop on fail) and decide whether a passing
+ * review should commit. Fields explicitly set in the config YAML are
+ * skipped (no prompt).
  * Returns the selected options (or config defaults if cancelled).
  */
 async function selectLoopOptions(
@@ -133,10 +135,62 @@ async function selectLoopOptions(
 ): Promise<{ autoCommit: boolean; autoReview: boolean; saveReviews: boolean }> {
 	const explicit = config.execution.explicitKeys;
 
-	// Skip the commit prompt when the YAML explicitly sets it.
+	// ── 1. Auto-review (asked FIRST) ──
+	// When enabled, a review gate runs BEFORE the commit: uncommitted changes
+	// are reviewed, and on a "fail" verdict the task is re-executed with the
+	// review feedback injected (looping until pass or maxReviewRetries is
+	// exhausted). Only then does the commit session run (when autoCommit is
+	// also enabled).
+	let autoReview: boolean;
+	if (explicit?.has("autoReview")) {
+		autoReview = config.execution.autoReview;
+	} else {
+		const reviewChoice = await ctx.ui.select("Auto-review after each task?", [
+			"Yes — review changes and loop on failures (re-execute until pass)",
+			"No — skip review",
+		]);
+		autoReview = reviewChoice
+			? reviewChoice.startsWith("Yes")
+			: config.execution.autoReview;
+	}
+
+	// ── 2. Save full review output to disk (only when review is enabled) ──
+	let saveReviews = false;
+	if (autoReview) {
+		if (explicit?.has("saveReviews")) {
+			saveReviews = config.execution.saveReviews;
+		} else {
+			const saveChoice = await ctx.ui.select(
+				"Save full review output to disk?",
+				[
+					"Yes — write each review to .ralpi/reviews/<loop>/<task>.md",
+					"No — keep reviews in-chat only",
+				],
+			);
+			saveReviews = saveChoice
+				? saveChoice.startsWith("Yes")
+				: config.execution.saveReviews;
+		}
+	}
+
+	// ── 3. Auto-commit (asked AFTER review) ──
+	// When review is enabled, this gates whether the changes are committed
+	// after a passing review (or after retries exhaust). When review is
+	// disabled, this is a stand-alone "commit per task" toggle.
 	let autoCommit: boolean;
 	if (explicit?.has("autoCommit")) {
 		autoCommit = config.execution.autoCommit;
+	} else if (autoReview) {
+		const commitChoice = await ctx.ui.select(
+			"Auto-commit after a passing review?",
+			[
+				"Yes — commit changes once the review passes",
+				"No — leave changes uncommitted after review",
+			],
+		);
+		autoCommit = commitChoice
+			? commitChoice.startsWith("Yes")
+			: config.execution.autoCommit;
 	} else {
 		const commitChoice = await ctx.ui.select("Auto-commit after each task?", [
 			"Yes — stage and commit changes automatically",
@@ -145,41 +199,6 @@ async function selectLoopOptions(
 		autoCommit = commitChoice
 			? commitChoice.startsWith("Yes")
 			: config.execution.autoCommit;
-	}
-
-	let autoReview = false;
-	let saveReviews = false;
-	if (autoCommit) {
-		// Skip the review prompt when the YAML explicitly sets it.
-		if (explicit?.has("autoReview")) {
-			autoReview = config.execution.autoReview;
-		} else {
-			const reviewChoice = await ctx.ui.select(
-				"Auto-review each commit against the task?",
-				["Yes — spawn a review agent after each commit", "No — skip review"],
-			);
-			autoReview = reviewChoice
-				? reviewChoice.startsWith("Yes")
-				: config.execution.autoReview;
-		}
-
-		// Only ask to persist reviews when reviews are actually enabled.
-		if (autoReview) {
-			if (explicit?.has("saveReviews")) {
-				saveReviews = config.execution.saveReviews;
-			} else {
-				const saveChoice = await ctx.ui.select(
-					"Save full review output to disk?",
-					[
-						"Yes — write each review to .ralpi/reviews/<loop>/<task>.md",
-						"No — keep reviews in-chat only",
-					],
-				);
-				saveReviews = saveChoice
-					? saveChoice.startsWith("Yes")
-					: config.execution.saveReviews;
-			}
-		}
 	}
 
 	return { autoCommit, autoReview, saveReviews };

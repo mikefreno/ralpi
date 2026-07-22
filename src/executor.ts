@@ -15,7 +15,6 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	buildTaskPrompt,
-	buildReviewPrompt,
 	buildReviewPromptUncommitted,
 	buildConflictResolutionPrompt,
 	MAX_DIFF_BYTES,
@@ -46,7 +45,6 @@ import {
 	hasUncommittedChanges,
 	getGitStatusPorcelain,
 	getGitDiff,
-	getLatestCommitDiff,
 	resolveModelSpec,
 	formatDuration,
 } from "./utils";
@@ -827,12 +825,13 @@ async function executeTask(
 				let finalReview: ReviewResult | undefined;
 				let reviewRetries = 0;
 
-				if (config.execution.autoCommit && config.execution.autoReview) {
-					// ── Review-gated commit: review FIRST, loop on reject, commit on pass ──
-					// The review examines uncommitted changes before the commit. If the
-					// verdict is "fail", the task is re-executed with the review feedback
-					// injected into the prompt (up to maxReviewRetries). Only when the
-					// review passes (or retries exhaust) does the commit session run.
+				if (config.execution.autoReview) {
+					// ── Review-gated loop: review FIRST, re-execute on reject, commit on pass ──
+					// The review examines uncommitted changes. If the verdict is "fail",
+					// the task is re-executed with the review feedback injected into the
+					// prompt (up to maxReviewRetries). On pass (or after retries exhaust)
+					// the commit session runs when autoCommit is also enabled — otherwise
+					// the changes are left uncommitted for manual inspection.
 					const maxRetries = config.execution.maxReviewRetries;
 					let attempt = 0;
 
@@ -876,7 +875,7 @@ async function executeTask(
 									`~ review for ${task.id} · ${task.title} — review session failed: ${reviewResult.error}`,
 									{ toolCalls: reviewToolCalls },
 								);
-								break; // commit what we have
+								break; // commit on autoCommit, otherwise leave uncommitted
 							}
 
 							const reviewText = reviewResult.text.trim();
@@ -953,9 +952,11 @@ async function executeTask(
 									return;
 								}
 								sendChatMessage?.(
-									`~ review for ${task.id} · ${task.title} — max retries (${maxRetries}) exhausted, committing anyway`,
+									config.execution.autoCommit
+										? `~ review for ${task.id} · ${task.title} — max retries (${maxRetries}) exhausted, committing anyway`
+										: `~ review for ${task.id} · ${task.title} — max retries (${maxRetries}) exhausted, leaving changes as-is`,
 								);
-								break; // commit what we have
+								break; // commit on autoCommit, otherwise leave uncommitted
 							}
 
 							attempt++;
@@ -998,7 +999,12 @@ async function executeTask(
 						}
 
 						// ── Commit (after review passes or retries exhausted) ──
-						if (hasUncommittedChanges(worktreeDir)) {
+						// Only commit when autoCommit is enabled; review-only mode leaves
+						// changes uncommitted so the user can inspect them manually.
+						if (
+							config.execution.autoCommit &&
+							hasUncommittedChanges(worktreeDir)
+						) {
 							const commitResult = await runCommitSession(
 								ctx,
 								config,
@@ -1026,7 +1032,7 @@ async function executeTask(
 						);
 					}
 				} else if (config.execution.autoCommit) {
-					// ── Commit only (no review) — legacy path ──
+					// ── Commit only (no review) ──
 					try {
 						if (hasUncommittedChanges(worktreeDir)) {
 							const commitResult = await runCommitSession(
@@ -1051,97 +1057,6 @@ async function executeTask(
 					} catch (error) {
 						sendChatMessage?.(
 							`~ commit for ${task.id} · ${task.title} — auto-commit error: ${
-								error instanceof Error ? error.message : String(error)
-							}`,
-						);
-					}
-				} else if (config.execution.autoReview) {
-					// ── Review only (no commit) — reviews latest commit — legacy path ──
-					try {
-						const commitInfo = getLatestCommitDiff(worktreeDir);
-						if (commitInfo && commitInfo.diff) {
-							const reviewPrompt = buildReviewPrompt(
-								task,
-								project,
-								commitInfo.hash,
-								commitInfo.subject,
-								commitInfo.diff,
-								config.prompts.projectContext,
-							);
-
-							const reviewModel = resolveFollowUpModel(
-								ctx,
-								config.execution.reviewModel,
-								currentModel,
-							);
-							const reviewModels = buildFailoverModels(reviewModel, roundRobin);
-
-							const { result: reviewResult, toolCalls: reviewToolCalls } =
-								await runFollowUpSession(
-									ctx,
-									config,
-									reviewPrompt,
-									worktreeDir,
-									`review for ${task.id} · ${task.title}`,
-									`review-${task.id}`,
-									config.execution.reviewTimeoutMs,
-									reviewModels,
-								);
-
-							if (reviewResult.success) {
-								const reviewText = reviewResult.text.trim();
-								const review = extractReview(
-									reviewText,
-									task.id,
-									commitInfo.hash,
-								);
-								finalReview = review ?? undefined;
-
-								let reviewPath: string | undefined;
-								if (review && config.execution.saveReviews) {
-									reviewPath = saveReviewJson(
-										projectDir,
-										config.paths.reviewsDir,
-										review,
-										progress.getKey(),
-									);
-								}
-
-								if (review) {
-									const label = `${verdictGlyph(review.verdict)} ${verdictSummary(review)}`;
-									const savedHint = reviewPath
-										? ` · saved to ${reviewPath}`
-										: "";
-									sendChatMessage?.(
-										`⚑ review for ${task.id} · ${task.title} — ${label}${savedHint}`,
-										{
-											toolCalls: reviewToolCalls,
-											reviewText,
-											reviewPath,
-											reviewResult: review,
-										},
-									);
-								} else {
-									const lines = reviewText.split("\n").filter((l) => l.trim());
-									const tail = lines.slice(-3).join("\n");
-									const savedHint = reviewPath
-										? ` \u00b7 saved to ${reviewPath}`
-										: "";
-									sendChatMessage?.(
-										`⚑ review for ${task.id} · ${task.title}${savedHint}\n${tail}`,
-										{ toolCalls: reviewToolCalls, reviewText, reviewPath },
-									);
-								}
-							} else {
-								sendChatMessage?.(
-									`~ review for ${task.id} · ${task.title} — review session failed: ${reviewResult.error}`,
-									{ toolCalls: reviewToolCalls },
-								);
-							}
-						}
-					} catch (error) {
-						sendChatMessage?.(
-							`~ review for ${task.id} · ${task.title} — auto-review error: ${
 								error instanceof Error ? error.message : String(error)
 							}`,
 						);
