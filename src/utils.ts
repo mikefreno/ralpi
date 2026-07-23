@@ -795,11 +795,12 @@ export function getLatestCommitDiff(
 			encoding: "utf-8",
 		}).trim();
 
-		// Full diff of the latest commit: stat overview + patch
+		// Full diff of the latest commit: stat overview + patch.
+		// maxBuffer set high — the prompt builder truncates to MAX_DIFF_BYTES.
 		const diff = execSync("git show HEAD --stat --patch", {
 			cwd: projectDir,
 			encoding: "utf-8",
-			maxBuffer: 1024 * 1024,
+			maxBuffer: 10 * 1024 * 1024,
 		}).trim();
 
 		return { hash, subject, diff };
@@ -868,10 +869,14 @@ export function getCommitRangeDiff(
 
 		// Diff from baseRef to HEAD — shows all committed changes made since
 		// the snapshot. Includes stat overview + full patch.
+		//
+		// maxBuffer is set high (10 MB) so larger tasks don't cause execSync to
+		// throw. The review prompt builder truncates to MAX_DIFF_BYTES (50 KB)
+		// before sending to the model, so the full diff in memory is fine.
 		const diff = execSync(`git diff ${baseRef} HEAD --stat --patch`, {
 			cwd: projectDir,
 			encoding: "utf-8",
-			maxBuffer: 1024 * 1024,
+			maxBuffer: 10 * 1024 * 1024,
 		}).trim();
 
 		if (!diff) return null; // no changes since baseRef

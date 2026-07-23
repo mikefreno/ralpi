@@ -877,7 +877,15 @@ async function executeTask(
 							const reviewInfo = baseRef
 								? getCommitRangeDiff(worktreeDir, baseRef)
 								: null;
-							if (!reviewInfo || !reviewInfo.diff) break; // nothing to review
+							if (!reviewInfo || !reviewInfo.diff) {
+								const reason = !baseRef
+									? "could not capture base ref before execution"
+									: "no changes found between base and HEAD";
+								sendChatMessage?.(
+									`~ review for ${task.id} · ${task.title} — skipping review (${reason})`,
+								);
+								break;
+							}
 
 							const reviewPrompt = buildReviewPrompt(
 								task,
