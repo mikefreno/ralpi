@@ -250,6 +250,7 @@ async function executePlanBatches(
 	mode: ExecutionMode,
 	sendChatMessage?: SendChatMessage,
 	projectDir?: string,
+	isResume?: boolean,
 ): Promise<void> {
 	// Write loop-active marker so a session reload can detect an interrupted
 	// loop and resume it (in-process agent sessions die on reload — the marker
@@ -268,7 +269,12 @@ async function executePlanBatches(
 		});
 
 		// Clean up stale worktrees from interrupted runs before starting.
-		if (config.execution.worktrees !== "never" && projectDir) {
+		// On resume this MUST be skipped: an interrupted in-progress task's
+		// worktree still carries its committed branch, which createWorktree()
+		// reuses to continue the task rather than restarting from scratch.
+		// The stale-worktree sweep only runs for fresh loops so concurrent
+		// loops (other PRDs) are still scoped out via the prdKey filter above.
+		if (!isResume && config.execution.worktrees !== "never" && projectDir) {
 			const removed = cleanupStaleWorktrees(
 				projectDir,
 				config.paths.stateDir,
@@ -944,6 +950,7 @@ async function resumeLoop(
 		mode,
 		sendChatMessage,
 		projectDir,
+		true, // isResume — preserve in-progress worktrees, continue them
 	);
 
 	if (!options?.skipFinalStatus) {

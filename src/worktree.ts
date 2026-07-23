@@ -153,28 +153,41 @@ export function createWorktree(
 ): WorktreeHandle | null {
 	if (!isGitRepo(mainDir)) return null;
 
-	const ref = baseRef ?? getGitHead(mainDir);
-	if (!ref) return null;
-
 	const safeId = safeBranchSuffix(taskId);
 	const slug = taskTitle ? slugifyTitle(taskTitle) : "";
 	const branch = slug || `ralpi/${prdKey}/${safeId}`;
 	const wtDir = worktreePath(mainDir, stateDir, prdKey, taskId);
 
+	// Prune metadata for worktree directories that no longer exist on disk
+	// (e.g. from a crashed previous run that left stale `.git/worktrees/` entries).
+	git("worktree prune", mainDir);
+
+	// ── Reuse an already-registered worktree (resume) ──
+	// A resumed loop skips `cleanupStaleWorktrees`, so the interrupted task's
+	// worktree — and the branch carrying its committed work — survives. Reuse
+	// it instead of destroying and recreating from the base ref; otherwise the
+	// prior session's commits are lost and the task restarts from scratch.
+	const existing = git(`worktree list --porcelain`, mainDir);
+	if (existing && existing.includes(`worktree ${wtDir}`)) {
+		// The worktree is registered — sanity-check it's a valid checkout.
+		if (getGitHead(wtDir)) {
+			return { dir: wtDir, branch, mainDir };
+		}
+		// Registered but broken (dir gone / checkout corrupt) — drop its
+		// metadata and fall through to fresh creation below.
+		git(`worktree remove --force "${wtDir}"`, mainDir);
+	}
+
+	// Fresh creation.
+	const ref = baseRef ?? getGitHead(mainDir);
+	if (!ref) return null;
+
 	// Ensure the parent directory exists so `git worktree add` can create
 	// the worktree directory inside it.
 	ensureDir(path.dirname(wtDir));
 
-	// Remove a stale worktree directory if one exists (e.g. from a crashed
-	// previous run). `git worktree add` fails if the path already exists.
-	// We prune first to clean up any metadata for removed-but-not-pruned dirs.
-	git("worktree prune", mainDir);
-	const existing = git(`worktree list --porcelain`, mainDir);
-	if (existing && existing.includes(`worktree ${wtDir}`)) {
-		// A worktree at this path is already registered — remove it.
-		git(`worktree remove --force "${wtDir}"`, mainDir);
-	}
-	// Also delete a stale branch if it exists from a previous run.
+	// Delete a stale branch if it exists from a previous run so `-b` doesn't
+	// fail on the new worktree.
 	git(`branch -D "${branch}"`, mainDir);
 
 	const result = gitRaw(
