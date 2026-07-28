@@ -18,7 +18,10 @@ import { formatReflections } from "./src/reflection";
 import { verdictGlyph, verdictSummary, formatFindings } from "./src/review";
 import type { ReviewResult } from "./src/types";
 import { executeBatch, type SendChatMessage } from "./src/executor";
-import { cleanupStaleWorktrees } from "./src/worktree";
+import {
+	cleanupStaleWorktrees,
+	finalizeCommittedWorktrees,
+} from "./src/worktree";
 import {
 	loadConfig,
 	resolveTaskArg,
@@ -220,7 +223,7 @@ async function selectPRDToResume(
 		const failed = Object.values(tasks).filter(
 			(t) => t.status === "failed",
 		).length;
-		const relPath = path.relative(process.cwd(), entry.prd.sourcePath);
+		const relPath = path.relative(ctx.cwd, entry.prd.sourcePath);
 		const updated = new Date(entry.prd.lastUpdatedAt).toLocaleString();
 		return `${relPath} — ${completed}/${total} done${failed ? `, ${failed} failed` : ""} · ${updated}`;
 	});
@@ -388,6 +391,31 @@ async function executePlanBatches(
 			);
 		}
 	}
+}
+
+// ─── Shared Helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Build a sendProgress closure that posts ralpi progress messages into the
+ * chat history for the expandable tool-call-tree renderer.
+ *
+ * Used by every registered command so they share one rendering path.
+ */
+function makeSendProgress(pi: ExtensionAPI): SendChatMessage {
+	return (content, meta) => {
+		pi.sendMessage({
+			customType: "ralpi-progress",
+			content,
+			display: true,
+			details: {
+				phase: "progress",
+				toolCalls: meta?.toolCalls,
+				reviewText: meta?.reviewText,
+				reviewPath: meta?.reviewPath,
+				reviewResult: meta?.reviewResult,
+			},
+		});
+	};
 }
 
 // ─── Extension Entry ────────────────────────────────────────────────────────
@@ -618,35 +646,7 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 			"Execute tasks from a task file using DAG-based dependency resolution",
 		handler: async (args: string, ctx: ExtensionContext) => {
 			const parts = (args || "").trim().split(/\s+/).filter(Boolean);
-
-			// Wraps pi.sendMessage() for posting status to the chat history.
-			// Uses "ralpi-progress" customType with a "progress" phase so the
-			// renderer omits the label prefix entirely (no [INFO] etc.).
-			// Accepts an optional meta object with toolCalls for the expandable view,
-			// and reviewText/reviewPath/reviewResult for review messages so the expanded
-			// (Ctrl+O) view can render the full review body without truncation.
-			const sendProgress: SendChatMessage = (
-				content: string,
-				meta?: {
-					toolCalls?: Array<{ name: string; label: string }>;
-					reviewText?: string;
-					reviewPath?: string;
-					reviewResult?: ReviewResult;
-				},
-			) => {
-				pi.sendMessage({
-					customType: "ralpi-progress",
-					content,
-					display: true,
-					details: {
-						phase: "progress",
-						toolCalls: meta?.toolCalls,
-						reviewText: meta?.reviewText,
-						reviewPath: meta?.reviewPath,
-						reviewResult: meta?.reviewResult,
-					},
-				});
-			};
+			const sendProgress = makeSendProgress(pi);
 
 			// If no args, show plan. If first token looks like a path (@path, /path, ./path),
 			// route to run so the execution mode prompt fires.
@@ -689,12 +689,12 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 					return handleReset(ctx, parts.slice(1));
 				default: {
 					// Auto-discover progress and offer resume
-					const found = findProgressFile(process.cwd());
+					const found = findProgressFile(ctx.cwd);
 					if (found) {
 						ctx.ui.notify(
 							`Unknown command: ${command}\n\nFound existing progress in ${
 								found.path
-							}\nUse /ralpi resume to continue.\n\nAvailable: ${COMMANDS.join(
+							}\nUse /ralpi-resume to continue.\n\nAvailable: ${COMMANDS.join(
 								", ",
 							)}`,
 							"warning",
@@ -709,6 +709,56 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 			}
 		},
 	});
+
+	// ─── Dedicated subcommands (dash namespace) ──────────────────────────
+	//
+	// Each subcommand is registered as its own top-level Pi command so the
+	// slash-menu autocompletes it directly (`/ralpi-run`, `/ralpi-resume`, …)
+	// instead of requiring the user to type `/ralpi <subcommand>` and rely on
+	// raw-string dispatch. `/ralpi` above remains as a back-compat dispatcher.
+	pi.registerCommand("ralpi-run", {
+		description: "Run tasks from a task file (DAG-based execution)",
+		handler: async (args: string, ctx: ExtensionContext) => {
+			const parts = (args || "").trim().split(/\s+/).filter(Boolean);
+			return handleRun(
+				ctx,
+				parts,
+				makeSendProgress(pi),
+				ctx.model,
+				pi.getThinkingLevel(),
+			);
+		},
+	});
+
+	pi.registerCommand("ralpi-plan", {
+		description: "Open the Task Manager to plan a ralpi run",
+		handler: async (_args: string, ctx: ExtensionContext) => {
+			pi.sendUserMessage("@task-manager");
+			ctx.ui.notify("Opening Task Manager...", "info");
+		},
+	});
+
+	pi.registerCommand("ralpi-resume", {
+		description: "Resume an interrupted ralpi loop from persisted progress",
+		handler: async (args: string, ctx: ExtensionContext) => {
+			const parts = (args || "").trim().split(/\s+/).filter(Boolean);
+			return handleResume(
+				ctx,
+				parts,
+				makeSendProgress(pi),
+				ctx.model,
+				pi.getThinkingLevel(),
+			);
+		},
+	});
+
+	pi.registerCommand("ralpi-reset", {
+		description: "Reset ralpi progress for a task file",
+		handler: async (args: string, ctx: ExtensionContext) => {
+			const parts = (args || "").trim().split(/\s+/).filter(Boolean);
+			return handleReset(ctx, parts);
+		},
+	});
 }
 
 // ─── /ralpi plan ─────────────────────────────────────────────────────────────
@@ -717,7 +767,7 @@ async function handlePlan(
 	ctx: ExtensionContext,
 	args: string[],
 ): Promise<void> {
-	const taskFile = resolveTaskArg(args[0] || "README.md", process.cwd());
+	const taskFile = resolveTaskArg(args[0] || "README.md", ctx.cwd);
 	const project = parseTaskFile(taskFile);
 	if (!Array.isArray(project.tasks)) {
 		throw new Error(
@@ -741,11 +791,11 @@ async function handleRun(
 	parentModel?: unknown,
 	parentThinkingLevel?: unknown,
 ): Promise<void> {
-	const taskFile = resolveTaskArg(args[0] || "README.md", process.cwd());
+	const taskFile = resolveTaskArg(args[0] || "README.md", ctx.cwd);
 
 	// If targeting a specific task file and there's existing progress for it,
 	// auto-resume instead of starting fresh
-	const existingProgress = findProgressFile(process.cwd(), taskFile);
+	const existingProgress = findProgressFile(ctx.cwd, taskFile);
 	if (existingProgress) {
 		return handleResume(
 			ctx,
@@ -757,7 +807,7 @@ async function handleRun(
 	}
 
 	// No existing progress for this task — check for any progress at all
-	const found = findProgressFile(process.cwd());
+	const found = findProgressFile(ctx.cwd);
 	if (found && !args[0]) {
 		// Offer to resume instead of starting fresh
 		const shouldResume = await ctx.ui.select(
@@ -776,9 +826,7 @@ async function handleRun(
 		}
 	}
 
-	const projectDir = found
-		? path.dirname(path.dirname(found.path))
-		: process.cwd();
+	const projectDir = found ? path.dirname(path.dirname(found.path)) : ctx.cwd;
 
 	const project = parseTaskFile(taskFile);
 	const config = loadConfig(projectDir);
@@ -880,11 +928,55 @@ async function resumeLoop(
 
 	progress.setPaused(false);
 
-	// Any task left `in_progress` died with the previous session (ralpi runs
-	// agents in-process). Reset them to `pending` so the DAG re-schedules
-	// them cleanly. Without this they'd still be re-run (they're not in the
-	// completed set), but the progress.json would carry a stale in_progress
-	// state during the rebuild window.
+	// ── Self-heal: finalize tasks that finished but were never merged ──
+	//
+	// A review-gated task whose agent committed + reviewed successfully still
+	// needs a final merge into main + worktree removal to be "done". If the
+	// loop was interrupted between that commit and the merge, the task is left
+	// `in_progress` with a clean, committed worktree branch. Resuming without
+	// finalizing would wastefully re-run finished work.
+	//
+	// finalizeCommittedWorktrees merges those branches into main now; the
+	// rest (dirty trees, nothing committed, conflicts) are left in_progress
+	// and reset to pending below for a real re-run.
+	const prdKeyForFinalize = progress.getKey();
+	const inProgressIds = Object.entries(progress.getState().tasks)
+		.filter(([, t]) => t.status === "in_progress")
+		.map(([id]) => id);
+	if (inProgressIds.length > 0) {
+		const fin = finalizeCommittedWorktrees(
+			projectDir,
+			config.paths.stateDir,
+			prdKeyForFinalize,
+			inProgressIds,
+		);
+		for (const id of fin.finalized) {
+			progress.markCompleted(id, 0);
+			try {
+				updateTaskInFile(taskFile, id, "completed");
+			} catch {
+				// Best-effort — progress.json is the source of truth for scheduling.
+			}
+			sendChatMessage?.(
+				`✓ ${id} — finalized on resume (committed branch merged into main)`,
+			);
+		}
+		const conflictIds = Object.keys(fin.conflicts);
+		if (conflictIds.length > 0) {
+			const detail = conflictIds
+				.map((id) => `${id}: ${fin.conflicts[id].slice(0, 3).join(", ")}`)
+				.join("; ");
+			sendChatMessage?.(
+				`⚠ ${conflictIds.join(", ")} — merge conflict on resume-finalize; re-running (${detail})`,
+			);
+		}
+	}
+
+	// Any task still `in_progress` (those NOT finalized above) died with the
+	// previous session (ralpi runs agents in-process). Reset them to `pending`
+	// so the DAG re-schedules them cleanly. Without this they'd still be
+	// re-run (they're not in the completed set), but the progress.json would
+	// carry a stale in_progress state during the rebuild window.
 	const resetIds = progress.resetInProgressToPending();
 	if (resetIds.length > 0) {
 		// Keep the source-file checkboxes in sync so a later parse sees these
@@ -970,8 +1062,8 @@ async function handleResume(
 	let prdKey: string | undefined;
 
 	if (args[0]) {
-		taskFile = resolveTaskArg(args[0], process.cwd());
-		const found = findProgressFile(process.cwd(), taskFile);
+		taskFile = resolveTaskArg(args[0], ctx.cwd);
+		const found = findProgressFile(ctx.cwd, taskFile);
 		if (!found) {
 			ctx.ui.notify(
 				`No existing progress for ${args[0]}. Start with /ralpi run ${args[0]}`,
@@ -982,7 +1074,7 @@ async function handleResume(
 		projectDir = path.dirname(path.dirname(found.path));
 		prdKey = found.prdKey;
 	} else {
-		const found = findProgressFile(process.cwd());
+		const found = findProgressFile(ctx.cwd);
 		if (!found) {
 			ctx.ui.notify(
 				"No .ralpi/progress.json found. Start with /ralpi run [task-file]",
@@ -1003,6 +1095,30 @@ async function handleResume(
 		prdKey = selected.prdKey;
 	}
 
+	// Reuse the loop snapshot (mode + autoCommit/autoReview/saveReviews)
+	// persisted when the loop started, so an interrupted loop resumes
+	// non-interactively — matching the auto-resume-on-reload path. Only fall
+	// back to interactive prompts when no snapshot is present.
+	const snapshot = readLoopActive(projectDir);
+	const loopOpts = (() => {
+		if (
+			snapshot &&
+			snapshot.prdKey === prdKey &&
+			snapshot.mode &&
+			snapshot.autoCommit !== undefined &&
+			snapshot.autoReview !== undefined &&
+			snapshot.saveReviews !== undefined
+		) {
+			return {
+				mode: snapshot.mode as ExecutionMode,
+				autoCommit: snapshot.autoCommit,
+				autoReview: snapshot.autoReview,
+				saveReviews: snapshot.saveReviews,
+			};
+		}
+		return undefined;
+	})();
+
 	await resumeLoop(
 		ctx,
 		taskFile,
@@ -1011,6 +1127,7 @@ async function handleResume(
 		sendChatMessage,
 		parentModel,
 		parentThinkingLevel,
+		loopOpts,
 	);
 }
 
@@ -1024,15 +1141,13 @@ async function handleReset(
 	args: string[],
 ): Promise<void> {
 	if (args[0]) {
-		const taskFile = resolveTaskArg(args[0], process.cwd());
-		const found = findProgressFile(process.cwd(), taskFile);
-		const projectDir = found
-			? path.dirname(path.dirname(found.path))
-			: process.cwd();
+		const taskFile = resolveTaskArg(args[0], ctx.cwd);
+		const found = findProgressFile(ctx.cwd, taskFile);
+		const projectDir = found ? path.dirname(path.dirname(found.path)) : ctx.cwd;
 		const progress = new ProgressTracker(projectDir, taskFile, found?.prdKey);
 		progress.reset();
 	} else {
-		const found = findProgressFile(process.cwd());
+		const found = findProgressFile(ctx.cwd);
 		if (!found) {
 			ctx.ui.notify(
 				"No .ralpi/progress.json found. Start with /ralpi run [task-file]",

@@ -1,5 +1,6 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
-import { ensureDir } from "./utils";
+import { ensureDir, hasUncommittedChanges } from "./utils";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -374,4 +375,108 @@ export function cleanupStaleWorktrees(
 
 	git("worktree prune", mainDir);
 	return removed;
+}
+
+/** Result of attempting to finalize a single in-progress worktree on resume. */
+export interface FinalizeResult {
+	/** Task IDs whose committed branch was merged into main and cleaned up. */
+	finalized: string[];
+	/** Task IDs left to re-run (no worktree, dirty tree, nothing committed,
+	 *  or merge conflict — work is preserved for re-execution). */
+	rerun: string[];
+	/** Task IDs that hit a merge conflict; their committed branch + worktree
+	 *  are left intact for manual resolution. Excluded from `rerun` so the
+	 *  scheduler does not blindly re-execute conflicting work. */
+	conflicts: Record<string, string[]>;
+}
+
+/**
+ * Finalize in-progress tasks whose worktrees already hold committed, clean
+ * work that was never merged into main (typically because the loop was
+ * interrupted between the task commit and the merge/finalize step).
+ *
+ * For each task ID:
+ *  - If no worktree exists / is registered → re-run (fresh worktree later).
+ *  - If the worktree working tree is dirty (uncommitted edits) → re-run,
+ *    preserving the worktree so `createWorktree` reuses it and the agent
+ *    continues where it left off.
+ *  - If the worktree is clean but has no commits ahead of main → re-run.
+ *  - If the worktree is clean AND has ≥1 commit ahead of main → merge the
+ *    branch into main (`--no-ff`), remove the worktree, and report finalized.
+ *    On merge conflict the merge is aborted (main left clean), the worktree
+ *    is preserved, and the task is reported in `conflicts`.
+ *
+ * This is the self-healing path for an interrupted review-gated loop:
+ * tasks that finished (commit + review already saved) but never got their
+ * merge are completed here, so `/ralpi-resume` does not wastefully re-run
+ * finished work.
+ */
+export function finalizeCommittedWorktrees(
+	mainDir: string,
+	stateDir: string,
+	prdKey: string,
+	taskIds: string[],
+): FinalizeResult {
+	const result: FinalizeResult = { finalized: [], rerun: [], conflicts: {} };
+
+	const mainHead = getGitHead(mainDir);
+
+	for (const taskId of taskIds) {
+		const wtDir = worktreePath(mainDir, stateDir, prdKey, taskId);
+
+		// No worktree directory on disk → nothing to finalize.
+		if (!fs.existsSync(wtDir)) {
+			result.rerun.push(taskId);
+			continue;
+		}
+
+		// Confirm the worktree is actually registered with git (not a leftover
+		// dir from a half-cleaned-up run). If registered but broken, drop its
+		// metadata so a fresh worktree can be created on re-run.
+		const list = git("worktree list --porcelain", mainDir) ?? "";
+		if (!list.includes(`worktree ${wtDir}`)) {
+			result.rerun.push(taskId);
+			continue;
+		}
+
+		// Broken checkout → re-run (createWorktree will recreate it).
+		const branch = getCurrentBranch(wtDir);
+		if (!branch || branch === "HEAD" || branch === "detached") {
+			result.rerun.push(taskId);
+			continue;
+		}
+
+		// Dirty working tree (uncommitted edits, e.g. an interrupted agent) →
+		// re-run, keeping the worktree so the agent resumes in place.
+		if (hasUncommittedChanges(wtDir)) {
+			result.rerun.push(taskId);
+			continue;
+		}
+
+		// Clean tree but nothing committed ahead of main → nothing to merge.
+		const aheadStr =
+			mainHead !== null
+				? git(`rev-list --count ${mainHead}..HEAD`, wtDir)
+				: null;
+		const ahead = aheadStr !== null ? parseInt(aheadStr, 10) : 0;
+		if (Number.isNaN(ahead) || ahead <= 0) {
+			result.rerun.push(taskId);
+			continue;
+		}
+
+		// Committed + clean → finalize. mergeWorktree aborts on conflict,
+		// leaving main's working tree clean.
+		const merge = mergeWorktree(mainDir, branch);
+		if (merge.success) {
+			removeWorktree(mainDir, { dir: wtDir, branch, mainDir });
+			result.finalized.push(taskId);
+			continue;
+		}
+
+		// Conflict — preserve the worktree for manual resolution and report.
+		result.conflicts[taskId] = merge.conflicts;
+	}
+
+	git("worktree prune", mainDir);
+	return result;
 }
