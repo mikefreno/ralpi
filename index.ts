@@ -732,8 +732,10 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("ralpi-plan", {
 		description: "Open the Task Manager to plan a ralpi run",
-		handler: async (_args: string, ctx: ExtensionContext) => {
-			pi.sendUserMessage("@task-manager");
+		handler: async (args: string, ctx: ExtensionContext) => {
+			const prompt = (args || "").trim();
+			const message = prompt ? `@task-manager\n\n${prompt}` : "@task-manager";
+			pi.sendUserMessage(message);
 			ctx.ui.notify("Opening Task Manager...", "info");
 		},
 	});
