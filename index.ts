@@ -35,8 +35,6 @@ import {
 	formatDuration,
 } from "./src/utils";
 
-const COMMANDS = ["plan", "resume", "reset"] as const;
-
 type ExecutionMode = "parallel" | "sequential";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -663,50 +661,12 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 				);
 			}
 
-			const command = parts[0];
-			switch (command) {
-				case "run":
-					return handleRun(
-						ctx,
-						parts.slice(1),
-						sendProgress,
-						ctx.model,
-						pi.getThinkingLevel(),
-					);
-				case "plan":
-					pi.sendUserMessage("@task-manager");
-					ctx.ui.notify("Opening Task Manager...", "info");
-					return;
-				case "resume":
-					return handleResume(
-						ctx,
-						parts.slice(1),
-						sendProgress,
-						ctx.model,
-						pi.getThinkingLevel(),
-					);
-				case "reset":
-					return handleReset(ctx, parts.slice(1));
-				default: {
-					// Auto-discover progress and offer resume
-					const found = findProgressFile(ctx.cwd);
-					if (found) {
-						ctx.ui.notify(
-							`Unknown command: ${command}\n\nFound existing progress in ${
-								found.path
-							}\nUse /ralpi-resume to continue.\n\nAvailable: ${COMMANDS.join(
-								", ",
-							)}`,
-							"warning",
-						);
-					} else {
-						ctx.ui.notify(
-							`Unknown command: ${command}\nAvailable: ${COMMANDS.join(", ")}`,
-							"error",
-						);
-					}
-				}
-			}
+			// Subcommands (run/plan/resume/reset) are handled by the dash commands
+			// below — /ralpi only dispatches no-args → plan and path → run.
+			ctx.ui.notify(
+				`Unknown: ${parts[0]}. Use /ralpi-run, /ralpi-plan, /ralpi-resume, or /ralpi-reset`,
+				"error",
+			);
 		},
 	});
 
