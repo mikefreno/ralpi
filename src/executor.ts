@@ -23,6 +23,7 @@ import { extractReflection } from "./reflection";
 import {
 	extractReview,
 	saveReviewToFile as saveReviewJson,
+	loadReview as loadReviewJson,
 	verdictGlyph,
 	verdictSummary,
 } from "./review";
@@ -813,6 +814,27 @@ async function executeTask(
 				? captureGitHead(worktreeDir)
 				: undefined;
 
+			// Load a prior review from disk when resuming an interrupted loop.
+			// If the previous run's review rejected the task (verdict 'fail') and the
+			// re-execution was lost to a crash/connection error, the findings would
+			// otherwise be orphaned. Injecting them here gives the fresh run the
+			// reviewer's feedback so it doesn't reintroduce the same blockers.
+			let priorReview: ReviewResult | undefined;
+			if (config.execution.autoReview) {
+				const loaded = loadReviewJson(
+					projectDir,
+					config.paths.reviewsDir,
+					task.id,
+					progress.getKey(),
+				);
+				if (loaded && loaded.verdict === "fail") {
+					priorReview = loaded;
+					sendChatMessage?.(
+						`↻ ${task.id} · ${task.title} — resuming with prior review feedback (${loaded.findings.length} findings)`,
+					);
+				}
+			}
+
 			// Run the task
 			const result = await runTask(
 				task,
@@ -825,6 +847,7 @@ async function executeTask(
 				parallelState,
 				currentModel,
 				batchRender,
+				priorReview,
 			);
 
 			if (result.success) {
@@ -1014,24 +1037,42 @@ async function executeTask(
 								`↻ review for ${task.id} · ${task.title} — verdict ${review?.verdict ?? "unknown"}, re-executing with feedback (${attempt}/${maxRetries})...`,
 							);
 
-							// Re-execute the task with review feedback injected.
-							const fixResult = await runTask(
-								task,
-								project,
-								config,
-								depReflections,
-								ctx,
-								sendChatMessage,
-								worktreeDir,
-								parallelState,
-								currentModel,
-								batchRender,
-								review ?? undefined,
-							);
+							// Re-execute the task with review feedback injected, cycling
+							// through failover models on connection errors so a flaky
+							// provider doesn't waste the review-fix attempt.
+							const fixModels = buildFailoverModels(currentModel, roundRobin);
+							let fixResult: Awaited<ReturnType<typeof runTask>> | undefined;
+							for (
+								let fixAttempt = 0;
+								fixAttempt < fixModels.length;
+								fixAttempt++
+							) {
+								const fixModel = fixModels[fixAttempt];
+								fixResult = await runTask(
+									task,
+									project,
+									config,
+									depReflections,
+									ctx,
+									sendChatMessage,
+									worktreeDir,
+									parallelState,
+									fixModel,
+									batchRender,
+									review ?? undefined,
+								);
+								if (fixResult.success) break;
+								// Connection/error failover — try the next model.
+								if (fixAttempt < fixModels.length - 1) {
+									sendChatMessage?.(
+										`~ re-execution for ${task.id} · ${task.title} — cycling to model ${fixAttempt + 2}/${fixModels.length} (previous: ${fixResult.error})`,
+									);
+								}
+							}
 
-							if (!fixResult.success) {
+							if (!fixResult || !fixResult.success) {
 								sendChatMessage?.(
-									`~ re-execution for ${task.id} · ${task.title} failed: ${fixResult.error}`,
+									`~ re-execution for ${task.id} · ${task.title} failed: ${fixResult?.error}`,
 								);
 								break; // proceed with what we have
 							}
