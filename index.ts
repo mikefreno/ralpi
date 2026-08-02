@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -14,6 +15,7 @@ import {
 } from "./src/dag";
 import { ProgressTracker } from "./src/progress";
 import { buildPlanPrompt } from "./src/prompts";
+import { loadTaskManagerPrompt } from "./src/task-manager-prompt";
 import { formatReflections } from "./src/reflection";
 import { verdictGlyph, verdictSummary, formatFindings } from "./src/review";
 import type { ReviewResult } from "./src/types";
@@ -255,6 +257,23 @@ async function executePlanBatches(
   projectDir?: string,
   isResume?: boolean,
 ): Promise<void> {
+  // Refresh the model registry so the host reloads models.json before we
+  // resolve the round-robin model pool. The registry snapshot is captured at
+  // host startup and only reloaded here; a long-running host would otherwise
+  // skip providers added to models.json after it booted (e.g. "strix").
+  // Best-effort: a failed refresh shouldn't block execution — the pool just
+  // resolves against the existing snapshot.
+  try {
+    await ctx.modelRegistry?.refresh();
+  } catch (error) {
+    ctx.ui.notify(
+      `ralpi: model registry refresh failed — continuing with existing snapshot: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      "warning",
+    );
+  }
+
   // Write loop-active marker so a session reload can detect an interrupted
   // loop and resume it (in-process agent sessions die on reload — the marker
   // + progress.json in_progress tasks are the signal to re-run them).
@@ -692,12 +711,18 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
     },
   });
 
+  const extensionDir = path.dirname(fileURLToPath(import.meta.url));
+
   pi.registerCommand("ralpi-plan", {
     description: "Open the Task Manager to plan a ralpi run",
     handler: async (args: string, ctx: ExtensionContext) => {
-      const prompt = (args || "").trim();
-      const message = prompt ? `@task-manager\n\n${prompt}` : "@task-manager";
-      pi.sendUserMessage(message);
+      // pi.sendUserMessage() sends with expandPromptTemplates: false, so it
+      // would NOT expand `/task-manager` — and `@task-manager` is an
+      // @-mention, not a template invocation. Load the bundled template,
+      // strip frontmatter, substitute $@ args ourselves, and send the
+      // expanded body directly.
+      const body = loadTaskManagerPrompt(extensionDir, args ?? "");
+      pi.sendUserMessage(body);
       ctx.ui.notify("Opening Task Manager...", "info");
     },
   });

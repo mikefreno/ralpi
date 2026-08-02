@@ -172,6 +172,23 @@ export function createWorktree(
 	if (existing && existing.includes(`worktree ${wtDir}`)) {
 		// The worktree is registered — sanity-check it's a valid checkout.
 		if (getGitHead(wtDir)) {
+			// Return the branch the worktree is ACTUALLY checked out on, NOT the
+			// slug recomputed from the (possibly changed) task title. Mismatch
+			// happens routinely on resume: the task agent may have created its
+			// own feature branch (e.g. `proctored-exam-delivery-mode-10-exam-...`)
+			// once it saw the convention in the git log, the title may have been
+			// edited between runs, or an older ralpi version used a different
+			// naming scheme. Returning the slug here makes `git merge <slug>`
+			// fail with "not something we can merge" because no such ref exists —
+			// exactly the spurious merge-conflict we see on resumes.
+			const actual = getCurrentBranch(wtDir);
+			if (actual && actual !== "HEAD" && actual !== "detached") {
+				return { dir: wtDir, branch: actual, mainDir };
+			}
+			// Detached-HEAD worktree (e.g. left by a prior `--detach` fallback).
+			// The slug ref doesn't exist as a branch — create one matching the
+			// slug from the worktree's current HEAD so the merge step resolves.
+			git(`branch "${branch}" HEAD`, mainDir);
 			return { dir: wtDir, branch, mainDir };
 		}
 		// Registered but broken (dir gone / checkout corrupt) — drop its
