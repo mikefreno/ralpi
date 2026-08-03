@@ -7,6 +7,7 @@ import type {
 	ToolUsage,
 } from "./types";
 import { DEFAULT_CONFIG } from "./types";
+import { parseTaskFile } from "./parser";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import {
 	createAgentSession,
@@ -196,6 +197,49 @@ export function listPRDsSorted(
 	});
 
 	return entries;
+}
+
+export interface PRDResumeSummary {
+	total: number;
+	completed: number;
+	failed: number;
+}
+
+/**
+ * Count tasks for the resume-selection display.
+ *
+ * The progress tracker only records tasks that were TOUCHED (started,
+ * completed, or failed) — never-started tasks are absent from `prd.tasks`,
+ * so a naive Object.keys(prd.tasks).length under-reports the real total.
+ * The true total comes from parsing the PRD source file. Completed counts
+ * both progress-marked completions and PRD checkbox completions (a task
+ * checked off in the file is done even if the loop was interrupted before
+ * markCompleted), deduped by task id. Falls back to touched-task counts
+ * when the source file is missing or unparseable.
+ */
+export function countPRDResumeStats(
+	prd: PRDProgress,
+	sourcePath: string,
+): PRDResumeSummary {
+	const touched = Object.entries(prd.tasks);
+	const failed = touched.filter(([, t]) => t.status === "failed").length;
+	const completedIds = new Set(
+		touched.filter(([, t]) => t.status === "completed").map(([id]) => id),
+	);
+
+	let total: number;
+	try {
+		const project = parseTaskFile(sourcePath);
+		total = project.tasks.length;
+		for (const task of project.tasks) {
+			if (task.status === "completed") completedIds.add(task.id);
+		}
+	} catch {
+		// PRD file missing/unparseable — fall back to touched-task counts
+		total = touched.length;
+	}
+
+	return { total, completed: completedIds.size, failed };
 }
 
 // ─── Model Resolution ───────────────────────────────────────────────────────
