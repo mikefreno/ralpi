@@ -142,6 +142,33 @@ export class ProgressTracker {
 
 	/** Save current state to disk */
 	save(): void {
+		// Merge into the freshest on-disk state instead of writing the
+		// construction-time snapshot verbatim. Each ProgressTracker instance
+		// (one per PRD loop) snapshots the WHOLE state at construction; when
+		// two loops run concurrently in one project, saving a stale snapshot
+		// would silently revert the OTHER loop's task status changes — tasks
+		// get wrongly written back to "pending" while their worktrees carry
+		// real work, stranding it on the next resume.
+		let disk: ProgressState | null = null;
+		try {
+			if (fs.existsSync(this.statePath)) {
+				const raw = fs.readFileSync(this.statePath, "utf-8");
+				disk = JSON.parse(raw) as ProgressState;
+			}
+		} catch {
+			disk = null;
+		}
+		if (disk && disk.prds) {
+			// Keep THIS tracker's in-memory PRD (its own tasks are the source
+			// of truth — all status mutations happened on it), but adopt the
+			// on-disk entries for OTHER PRDs instead of writing the stale
+			// construction-time snapshot over them.
+			const mine = this.getPRD();
+			this.state = disk;
+			this.state.prds ??= {};
+			this.state.prds[this.prdKey] = mine;
+		}
+
 		const prd = this.getPRD();
 		prd.lastUpdatedAt = new Date().toISOString();
 		// Sync legacy flat fields with current PRD for backward compat

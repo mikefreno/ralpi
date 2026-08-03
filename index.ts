@@ -23,6 +23,7 @@ import { executeBatch, type SendChatMessage } from "./src/executor";
 import {
   cleanupStaleWorktrees,
   finalizeCommittedWorktrees,
+  abortMerge,
 } from "./src/worktree";
 import {
   loadConfig,
@@ -585,27 +586,9 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
         t.status === "in_progress" ? [id] : [],
       );
 
-      if (inProgressIds.length === 0) {
-        // Nothing was mid-flight — loop either finished cleanly between
-        // the reload landing and this handler running, or was stopped
-        // between tasks. Clean up the stale marker and bail.
-        ctx.ui.notify(
-          "ralpi loop has no in-progress task to resume — marking complete.",
-          "info",
-        );
-        deleteLoopActive(projectDir);
-        return;
-      }
-
-      const taskCount = loopState.taskIds.length;
-      ctx.ui.notify(
-        `ralpi loop was interrupted by reload with ${inProgressIds.length} in-progress task(s). ` +
-          `Resuming execution (${taskCount} tasks, ${loopState.mode} mode)...`,
-        "info",
-      );
-
       // Build the sendProgress wrapper so resumed task messages render the
-      // same expandable tool-call tree as an interactive run.
+      // same expandable tool-call tree as an interactive run. Defined before
+      // the finalize path below so it can report self-healed merges.
       const sendProgress: SendChatMessage = (
         content: string,
         meta?: {
@@ -628,6 +611,121 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
           },
         });
       };
+
+      if (inProgressIds.length === 0) {
+        // Nothing was mid-flight — the loop either finished cleanly between
+        // the reload landing and this handler running, or was stopped
+        // between tasks. Either way, committed worktree branches from an
+        // interrupted loop may still be unmerged (e.g. a prior resume
+        // attempt reset tasks to pending before it was itself interrupted).
+        // Finalize those first so committed code lands in the workspace,
+        // persist the state to progress.json, update the PRD file, THEN
+        // clean up the stale marker.
+        try {
+          const config = loadConfig(projectDir);
+          // Clear any half-done merge left by an interrupted
+          // conflict-resolution session (it would block every merge below).
+          abortMerge(projectDir);
+          const allIds = Object.entries(initialTasks).flatMap(([id, t]) =>
+            t.status !== "failed" && t.status !== "pending" ? [id] : [],
+          );
+          const fin = finalizeCommittedWorktrees(
+            projectDir,
+            config.paths.stateDir,
+            loopState.prdKey,
+            allIds,
+          );
+          // Persist finalized tasks to progress.json + PRD file so the
+          // state is correct for subsequent /ralpi resume calls.
+          const stateDir = config.paths.stateDir;
+          const progressPath = path.join(projectDir, stateDir, "progress.json");
+          // Batch-update progress.json and PRD file for all finalized tasks
+          if (fin.finalized.length > 0) {
+            const progressRaw = fs.existsSync(progressPath)
+              ? JSON.parse(fs.readFileSync(progressPath, "utf-8"))
+              : null;
+            for (const id of fin.finalized) {
+              sendProgress?.(
+                `✓ ${id} — finalized on resume (committed branch merged into main)`,
+              );
+              if (progressRaw) {
+                const tasks =
+                  progressRaw.prds?.[loopState.prdKey]?.tasks ?? progressRaw.tasks;
+                if (tasks && tasks[id]) {
+                  tasks[id].status = "completed";
+                  tasks[id].completedAt = new Date().toISOString();
+                }
+              }
+              try {
+                const prdPath = loopState.taskFile;
+                if (fs.existsSync(prdPath)) {
+                  updateTaskInFile(prdPath, id, "completed");
+                }
+              } catch {
+                // Best-effort
+              }
+            }
+            if (progressRaw) {
+              fs.writeFileSync(progressPath, JSON.stringify(progressRaw, null, 2), "utf-8");
+            }
+          }
+          // ── Handle conflicted tasks ──
+          // Same logic as resumeLoop: reset to pending so the DAG can
+          // re-schedule them, keep the worktree for in-place re-run.
+          const conflictIds = Object.keys(fin.conflicts);
+          if (conflictIds.length > 0) {
+            const detail = conflictIds
+              .map((id) => `${id}: ${fin.conflicts[id].slice(0, 3).join(", ")}`)
+              .join("; ");
+            // Batch-reset all conflicted tasks to pending, then write once
+            const progressRaw = fs.existsSync(progressPath)
+              ? JSON.parse(fs.readFileSync(progressPath, "utf-8"))
+              : null;
+            for (const id of conflictIds) {
+              if (progressRaw) {
+                const tasks =
+                  progressRaw.prds?.[loopState.prdKey]?.tasks ?? progressRaw.tasks;
+                if (tasks && tasks[id]) {
+                  tasks[id].status = "pending";
+                  delete tasks[id].startedAt;
+                  delete tasks[id].error;
+                }
+              }
+              try {
+                const prdPath = loopState.taskFile;
+                if (fs.existsSync(prdPath)) {
+                  updateTaskInFile(prdPath, id, "pending");
+                }
+              } catch {
+                // Best-effort
+              }
+            }
+            if (progressRaw) {
+              fs.writeFileSync(progressPath, JSON.stringify(progressRaw, null, 2), "utf-8");
+            }
+            ctx.ui.notify(
+              `Reset ${conflictIds.length} conflicted task(s) to pending for re-execution (${detail})`,
+              "info",
+            );
+          }
+        } catch {
+          // Best-effort — the marker is removed either way; the worktrees
+          // stay on disk for a manual /ralpi-resume.
+        }
+        ctx.ui.notify(
+          "ralpi loop has no in-progress task to resume — marking complete.",
+          "info",
+        );
+        deleteLoopActive(projectDir);
+        return;
+      }
+
+      const taskCount = loopState.taskIds.length;
+      ctx.ui.notify(
+        `ralpi loop was interrupted by reload with ${inProgressIds.length} in-progress task(s). ` +
+          `Resuming execution (${taskCount} tasks, ${loopState.mode} mode)...`,
+        "info",
+      );
 
       // Load config from the project directory so model + thinking level
       // resolve the same way the interactive command handler does.
@@ -922,22 +1020,36 @@ async function resumeLoop(
   // A review-gated task whose agent committed + reviewed successfully still
   // needs a final merge into main + worktree removal to be "done". If the
   // loop was interrupted between that commit and the merge, the task is left
-  // `in_progress` with a clean, committed worktree branch. Resuming without
-  // finalizing would wastefully re-run finished work.
+  // with a committed worktree branch. Resuming without finalizing would
+  // wastefully re-run finished work — or worse, strand the committed code in
+  // `.ralpi/worktrees/` forever.
   //
-  // finalizeCommittedWorktrees merges those branches into main now; the
-  // rest (dirty trees, nothing committed, conflicts) are left in_progress
-  // and reset to pending below for a real re-run.
+  // finalizeCommittedWorktrees runs over EVERY non-failed task, not just
+  // `in_progress` ones: a prior interrupted resume can reset tasks to
+  // `pending` while their worktree branch still holds committed work that
+  // was never merged. Only scanning in_progress tasks would silently leave
+  // that code out of the workspace on every resume.
+  //
+  // `pending` tasks (never started) are excluded — they never had worktrees
+  // created, so finalize always puts them in `rerun`, which is wasted work.
+  // Failed tasks keep their worktrees for inspection/re-run and are also
+  // deliberately excluded.
   const prdKeyForFinalize = progress.getKey();
-  const inProgressIds = Object.entries(progress.getState().tasks)
-    .filter(([, t]) => t.status === "in_progress")
-    .map(([id]) => id);
-  if (inProgressIds.length > 0) {
+  // Clear any half-done merge left in the main repo by an interrupted
+  // conflict-resolution session — it would block every merge below
+  // (`git merge` refuses while a merge is already in progress). No-op when
+  // the repo isn't mid-merge.
+  abortMerge(projectDir);
+  const finalizeCandidateIds = Object.entries(progress.getState().tasks)
+    .flatMap(([id, t]) =>
+      t.status !== "failed" && t.status !== "pending" ? [id] : [],
+    );
+  if (finalizeCandidateIds.length > 0) {
     const fin = finalizeCommittedWorktrees(
       projectDir,
       config.paths.stateDir,
       prdKeyForFinalize,
-      inProgressIds,
+      finalizeCandidateIds,
     );
     for (const id of fin.finalized) {
       progress.markCompleted(id, 0);
@@ -950,15 +1062,47 @@ async function resumeLoop(
         `✓ ${id} — finalized on resume (committed branch merged into main)`,
       );
     }
+    // ── Handle conflicted tasks ──
+    //
+    // Tasks whose committed branch could not be auto-merged (git conflicts)
+    // must be reset to `pending` so the DAG re-schedules them. The worktree
+    // is preserved — the agent re-runs in-place in the existing worktree via
+    // createWorktree's reuse logic. If the agent's re-run changes make the
+    // merge succeed on the next attempt, the loop continues normally. If the
+    // merge fails again, `executeBatch`'s batch-level conflict resolution
+    // (`resolveConflictsSession`) handles the conflict markers properly.
     const conflictIds = Object.keys(fin.conflicts);
     if (conflictIds.length > 0) {
       const detail = conflictIds
         .map((id) => `${id}: ${fin.conflicts[id].slice(0, 3).join(", ")}`)
         .join("; ");
+      // Batch-reset all conflicted tasks to pending, then save once.
+      // Directly mutate the progress state (there's no markPending method
+      // on ProgressTracker — markFailed would leave it as 'failed' which the
+      // DAG excludes). The worktree is preserved so createWorktree reuses
+      // it and the agent re-runs in-place.
+      const tasks = progress.getState().tasks;
+      for (const id of conflictIds) {
+        if (tasks[id]) {
+          tasks[id].status = "pending";
+          delete tasks[id].startedAt;
+          delete tasks[id].error;
+        }
+        try {
+          updateTaskInFile(taskFile, id, "pending");
+        } catch {
+          // Best-effort
+        }
+      }
+      progress.save();
       sendChatMessage?.(
         `⚠ ${conflictIds.join(
           ", ",
-        )} — merge conflict on resume-finalize; re-running (${detail})`,
+        )} — merge conflict on resume-finalize; reset to pending for re-execution (${detail})`,
+      );
+      ctx.ui.notify(
+        `Reset ${conflictIds.length} conflicted task(s) to pending for re-execution`,
+        "info",
       );
     }
   }

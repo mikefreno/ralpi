@@ -673,6 +673,8 @@ function extractAssistantText(content: unknown): string {
 
 /**
  * Check if there are any uncommitted changes in the git repository.
+ * Includes untracked files — a new file created by a task agent is work
+ * that still needs committing.
  */
 export function hasUncommittedChanges(projectDir: string): boolean {
 	const { execSync } = require("node:child_process");
@@ -682,6 +684,32 @@ export function hasUncommittedChanges(projectDir: string): boolean {
 			encoding: "utf-8",
 		}).trim();
 		return output.length > 0;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Check for uncommitted changes to TRACKED files only, ignoring untracked
+ * (`??`) entries.
+ *
+ * Untracked files never block a merge, so a worktree whose task work is
+ * fully committed is "done" even when it carries stray untracked files
+ * (scratch files, build artifacts, files created but deliberately left out
+ * of the commit). Resume-finalize uses this to decide whether a task's
+ * committed branch should be merged into main: counting `??` entries there
+ * would strand committed code in `.ralpi/worktrees/` forever.
+ */
+export function hasTrackedUncommittedChanges(projectDir: string): boolean {
+	const { execSync } = require("node:child_process");
+	try {
+		const output = execSync("git status --porcelain", {
+			cwd: projectDir,
+			encoding: "utf-8",
+		}).trim();
+		return output
+			.split("\n")
+			.some((line: string) => line.length > 0 && !line.startsWith("??"));
 	} catch {
 		return false;
 	}

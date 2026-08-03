@@ -1,6 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { ensureDir, hasUncommittedChanges } from "./utils";
+import {
+	ensureDir,
+	hasUncommittedChanges,
+	hasTrackedUncommittedChanges,
+} from "./utils";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -83,6 +87,28 @@ export function getCurrentBranch(dir: string): string | null {
 	return git("rev-parse --abbrev-ref HEAD", dir);
 }
 
+/**
+ * Canonicalize a directory path, resolving symlinks.
+ *
+ * `git worktree list --porcelain` emits REAL paths (symlinks resolved,
+ * e.g. `/private/tmp/...` for `/tmp/...` on macOS), while `path.join` on a
+ * caller-supplied path keeps the literal spelling. Comparing the two
+ * verbatim silently fails — resume then can't see an existing worktree,
+ * `createWorktree` falls through to a fresh `worktree add` that fails
+ * because the directory already exists, returns null, and the task agent
+ * ends up running in the MAIN repo with no worktree merge at all.
+ *
+ * All worktree path computation and porcelain comparisons go through this
+ * so literal vs real paths can never diverge.
+ */
+function canonicalDir(dir: string): string {
+	try {
+		return fs.realpathSync(dir);
+	} catch {
+		return path.resolve(dir);
+	}
+}
+
 // ─── Worktree Lifecycle ──────────────────────────────────────────────────────
 
 /**
@@ -152,6 +178,9 @@ export function createWorktree(
 	baseRef?: string,
 	taskTitle?: string,
 ): WorktreeHandle | null {
+	// Canonicalize FIRST: every path below (worktree dir, porcelain
+	// comparisons, branch refs) must share one spelling of the repo path.
+	mainDir = canonicalDir(mainDir);
 	if (!isGitRepo(mainDir)) return null;
 
 	const safeId = safeBranchSuffix(taskId);
@@ -357,7 +386,7 @@ export function cleanupStaleWorktrees(
 	// When a prdKey is given, narrow to that PRD's subdir so concurrent
 	// loops (other PRDs) are not disturbed.
 	const managedRoot = path.resolve(
-		mainDir,
+		canonicalDir(mainDir),
 		stateDir,
 		"worktrees",
 		...(prdKey ? [prdKey] : []),
@@ -408,20 +437,27 @@ export interface FinalizeResult {
 }
 
 /**
- * Finalize in-progress tasks whose worktrees already hold committed, clean
- * work that was never merged into main (typically because the loop was
- * interrupted between the task commit and the merge/finalize step).
+ * Finalize worktrees that already hold committed, clean work that was never
+ * merged into main (typically because the loop was interrupted between the
+ * task commit and the merge/finalize step).
  *
  * For each task ID:
  *  - If no worktree exists / is registered → re-run (fresh worktree later).
- *  - If the worktree working tree is dirty (uncommitted edits) → re-run,
- *    preserving the worktree so `createWorktree` reuses it and the agent
- *    continues where it left off.
- *  - If the worktree is clean but has no commits ahead of main → re-run.
- *  - If the worktree is clean AND has ≥1 commit ahead of main → merge the
- *    branch into main (`--no-ff`), remove the worktree, and report finalized.
- *    On merge conflict the merge is aborted (main left clean), the worktree
- *    is preserved, and the task is reported in `conflicts`.
+ *  - If the worktree has uncommitted edits to TRACKED files (e.g. an
+ *    interrupted agent mid-edit) → re-run, preserving the worktree so
+ *    `createWorktree` reuses it and the agent continues where it left off.
+ *    Untracked files are ignored here — they never block a merge, and a
+ *    worktree whose task work is fully committed is "done" even if it
+ *    carries stray untracked files. Counting `??` entries would strand the
+ *    committed branch in `.ralpi/worktrees/` forever on every resume.
+ *  - If the worktree has no commits ahead of main → re-run.
+ *  - If the worktree has ≥1 commit ahead of main → merge the branch into
+ *    main (`--no-ff`) and report finalized. Fully clean worktrees are then
+ *    removed; worktrees that also carry untracked files are kept so that
+ *    (possibly meaningful) uncommitted files aren't destroyed — the next
+ *    fresh-loop sweep cleans them up. On merge conflict the merge is
+ *    aborted (main left clean), the worktree is preserved, and the task is
+ *    reported in `conflicts`.
  *
  * This is the self-healing path for an interrupted review-gated loop:
  * tasks that finished (commit + review already saved) but never got their
@@ -434,6 +470,7 @@ export function finalizeCommittedWorktrees(
 	prdKey: string,
 	taskIds: string[],
 ): FinalizeResult {
+	mainDir = canonicalDir(mainDir);
 	const result: FinalizeResult = { finalized: [], rerun: [], conflicts: {} };
 
 	const mainHead = getGitHead(mainDir);
@@ -463,14 +500,15 @@ export function finalizeCommittedWorktrees(
 			continue;
 		}
 
-		// Dirty working tree (uncommitted edits, e.g. an interrupted agent) →
-		// re-run, keeping the worktree so the agent resumes in place.
-		if (hasUncommittedChanges(wtDir)) {
+		// Uncommitted edits to TRACKED files (an interrupted agent mid-edit) →
+		// re-run, keeping the worktree so the agent resumes in place. Untracked
+		// files alone do NOT count as dirty here (see doc comment above).
+		if (hasTrackedUncommittedChanges(wtDir)) {
 			result.rerun.push(taskId);
 			continue;
 		}
 
-		// Clean tree but nothing committed ahead of main → nothing to merge.
+		// No commits ahead of main → nothing to merge.
 		const aheadStr =
 			mainHead !== null
 				? git(`rev-list --count ${mainHead}..HEAD`, wtDir)
@@ -481,11 +519,17 @@ export function finalizeCommittedWorktrees(
 			continue;
 		}
 
-		// Committed + clean → finalize. mergeWorktree aborts on conflict,
-		// leaving main's working tree clean.
+		// Committed + no tracked edits → finalize. mergeWorktree aborts on
+		// conflict, leaving main's working tree clean.
 		const merge = mergeWorktree(mainDir, branch);
 		if (merge.success) {
-			removeWorktree(mainDir, { dir: wtDir, branch, mainDir });
+			// Remove the worktree only when it's fully clean. If it still carries
+			// untracked files, keep it so that uncommitted work isn't destroyed
+			// (the branch is merged; the leftover worktree is swept by the next
+			// fresh-loop cleanup).
+			if (!hasUncommittedChanges(wtDir)) {
+				removeWorktree(mainDir, { dir: wtDir, branch, mainDir });
+			}
 			result.finalized.push(taskId);
 			continue;
 		}
@@ -496,4 +540,25 @@ export function finalizeCommittedWorktrees(
 
 	git("worktree prune", mainDir);
 	return result;
+}
+
+/**
+ * Whether a worktree still holds work worth preserving (committed commits
+ * ahead of main, or uncommitted changes). Used by the task-failure path so a
+ * failed/timeout agent's partial output isn't force-deleted with the
+ * worktree.
+ */
+export function worktreeHasPreservableWork(
+	mainDir: string,
+	wt: WorktreeHandle,
+): boolean {
+	mainDir = canonicalDir(mainDir);
+	// Any uncommitted changes (tracked edits or untracked files) count — the
+	// agent may have been mid-write when it failed.
+	if (hasUncommittedChanges(wt.dir)) return true;
+	const mainHead = getGitHead(mainDir);
+	if (!mainHead) return true;
+	const aheadStr = git(`rev-list --count ${mainHead}..${wt.branch}`, mainDir);
+	const ahead = aheadStr !== null ? parseInt(aheadStr, 10) : 0;
+	return !Number.isNaN(ahead) && ahead > 0;
 }

@@ -35,6 +35,7 @@ import {
 	abortMerge,
 	hasMergeConflicts,
 	completeMerge,
+	worktreeHasPreservableWork,
 	type WorktreeHandle,
 	type MergeResult,
 } from "./worktree";
@@ -1248,7 +1249,7 @@ async function executeTask(
 				}`,
 				"error",
 			);
-			if (wt) removeWorktree(projectDir, wt);
+			cleanupFailedWorktree(projectDir, wt, task, sendChatMessage);
 			roundRobin?.release(task.id);
 			return;
 		} catch (error) {
@@ -1264,7 +1265,7 @@ async function executeTask(
 			}
 			sendChatMessage?.(`✗ ${task.id} · ${task.title} — ${errorMsg}`);
 			ctx.ui.notify(`Task ${task.id} failed: ${errorMsg}`, "error");
-			if (wt) removeWorktree(projectDir, wt);
+			cleanupFailedWorktree(projectDir, wt, task, sendChatMessage);
 			return;
 		}
 	}
@@ -1280,10 +1281,36 @@ async function executeTask(
 		`Task ${task.id} failed: all configured models exhausted`,
 		"error",
 	);
-	if (wt) removeWorktree(projectDir, wt);
+	cleanupFailedWorktree(projectDir, wt, task, sendChatMessage);
 }
 
 // ─── Save Reflection to File ────────────────────────────────────────────────
+
+/**
+ * Remove a task worktree after a failure UNLESS it still holds recoverable
+ * work (commits ahead of main, or uncommitted changes).
+ *
+ * `removeWorktree` force-deletes the worktree's branch, which makes any
+ * commits the agent made before failing/timing out unreachable — real code
+ * loss. A preserved worktree is instead picked up on the next resume:
+ * resume-finalize merges committed work into main, or the task re-runs in
+ * place and the agent continues from where it stopped.
+ */
+function cleanupFailedWorktree(
+	projectDir: string,
+	wt: WorktreeHandle | null,
+	task: Task,
+	sendChatMessage?: SendChatMessage,
+): void {
+	if (!wt) return;
+	if (worktreeHasPreservableWork(projectDir, wt)) {
+		sendChatMessage?.(
+			`~ ${task.id} · ${task.title} — task failed but worktree preserved (${wt.branch}); committed work will be merged on resume`,
+		);
+		return;
+	}
+	removeWorktree(projectDir, wt);
+}
 
 function saveReflectionToFile(
 	sourceDir: string,
