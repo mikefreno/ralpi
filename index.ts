@@ -201,13 +201,14 @@ async function selectLoopOptions(
 
 /**
  * When multiple PRD loops have progress, prompt the user to select which one
- * to resume. Returns the selected PRD key and sourcePath.
+ * to act on. Returns the selected PRD key and sourcePath.
  * If only one PRD exists, returns it without prompting.
  * Returns null if no PRDs exist.
  */
-async function selectPRDToResume(
+async function selectPRD(
 	ctx: ExtensionContext,
 	found: NonNullable<ReturnType<typeof findProgressFile>>,
+	prompt: string,
 ): Promise<{ prdKey: string; sourcePath: string } | null> {
 	const prds = listPRDsSorted(found.state);
 	if (prds.length === 0) return null;
@@ -230,10 +231,7 @@ async function selectPRDToResume(
 		return `${relPath} — ${completed}/${total} done${failed ? `, ${failed} failed` : ""} · ${updated}`;
 	});
 
-	const selected = await ctx.ui.select(
-		"Multiple loops found. Which to resume?",
-		options,
-	);
+	const selected = await ctx.ui.select(prompt, options);
 	if (!selected) return null;
 
 	const idx = options.indexOf(selected);
@@ -1231,7 +1229,11 @@ async function handleResume(
 
 		// When no specific task file is given, let the user select which loop
 		// to resume from multiple PRDs (sorted by most recent first).
-		const selected = await selectPRDToResume(ctx, found);
+		const selected = await selectPRD(
+			ctx,
+			found,
+			"Multiple loops found. Which to resume?",
+		);
 		if (!selected) {
 			ctx.ui.notify("Resume cancelled.", "info");
 			return;
@@ -1301,11 +1303,23 @@ async function handleReset(
 			return;
 		}
 		const projectDir = path.dirname(path.dirname(found.path));
-		// Use the most recently updated PRD (first in sorted order)
-		const prds = listPRDsSorted(found.state);
-		const sourcePath =
-			prds.length > 0 ? prds[0].prd.sourcePath : found.state.sourcePath;
-		const progress = new ProgressTracker(projectDir, sourcePath);
+
+		// Multiple loops may have progress — let the user select which one to
+		// reset (sorted by most recent first), same as resume.
+		const selected = await selectPRD(
+			ctx,
+			found,
+			"Multiple loops found. Which to reset?",
+		);
+		if (!selected) {
+			ctx.ui.notify("Reset cancelled.", "info");
+			return;
+		}
+		const progress = new ProgressTracker(
+			projectDir,
+			selected.sourcePath,
+			selected.prdKey,
+		);
 		progress.reset();
 	}
 
