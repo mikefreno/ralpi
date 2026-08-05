@@ -1434,7 +1434,7 @@ async function runFollowUpSession(
 				undefined,
 				model,
 				config.thinkingLevel,
-				true, // noSkills — follow-up sessions don't need the skills catalog
+				false, // noSkills=false — follow-up sessions load skills too
 				(ctx.modelRegistry as any).runtime as ModelRuntime,
 			);
 

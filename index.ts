@@ -1287,12 +1287,17 @@ async function handleReset(
 	ctx: ExtensionContext,
 	args: string[],
 ): Promise<void> {
+	let sourcePath: string;
+	let prdKey: string | undefined;
+	let progress: ProgressTracker;
+
 	if (args[0]) {
 		const taskFile = resolveTaskArg(args[0], ctx.cwd);
 		const found = findProgressFile(ctx.cwd, taskFile);
 		const projectDir = found ? path.dirname(path.dirname(found.path)) : ctx.cwd;
-		const progress = new ProgressTracker(projectDir, taskFile, found?.prdKey);
-		progress.reset();
+		sourcePath = taskFile;
+		prdKey = found?.prdKey;
+		progress = new ProgressTracker(projectDir, taskFile, prdKey);
 	} else {
 		const found = findProgressFile(ctx.cwd);
 		if (!found) {
@@ -1315,13 +1320,41 @@ async function handleReset(
 			ctx.ui.notify("Reset cancelled.", "info");
 			return;
 		}
-		const progress = new ProgressTracker(
-			projectDir,
-			selected.sourcePath,
-			selected.prdKey,
-		);
-		progress.reset();
+		sourcePath = selected.sourcePath;
+		prdKey = selected.prdKey;
+		progress = new ProgressTracker(projectDir, sourcePath, prdKey);
 	}
 
+	// Ask whether to also clear the progress markers (checkboxes/status) in the
+	// source PRD/README file itself, not just .ralpi/progress.json.
+	const taskIds = Object.keys(progress.getState().tasks);
+	if (taskIds.length > 0) {
+		const choice = await ctx.ui.select(
+			`Also reset progress markers in the source file (${path.basename(
+				sourcePath,
+			)})?`,
+			[
+				"Yes — clear checkboxes/status markers in the source PRD/README",
+				"No — only reset .ralpi/progress.json",
+			],
+		);
+		if (choice === undefined) {
+			ctx.ui.notify("Reset cancelled.", "info");
+			return;
+		}
+		if (choice.startsWith("Yes")) {
+			progress.reset();
+			for (const id of taskIds) {
+				updateTaskInFile(sourcePath, id, "pending");
+			}
+			ctx.ui.notify(
+				`Progress reset — cleared ${taskIds.length} task marker(s) in ${path.basename(sourcePath)}.`,
+				"info",
+			);
+			return;
+		}
+	}
+
+	progress.reset();
 	ctx.ui.notify("Progress reset. All task statuses cleared.", "info");
 }
