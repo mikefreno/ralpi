@@ -6,7 +6,10 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { buildReviewPrompt, buildReviewPromptUncommitted } from "../src/prompts";
+import {
+	buildReviewPrompt,
+	buildReviewPromptUncommitted,
+} from "../src/prompts";
 import { compileIgnorePatterns } from "../src/diff";
 import type { Task, Project } from "../src/types";
 
@@ -33,7 +36,7 @@ const MIXED_DIFF = [
 	"--- a/src/auth.ts",
 	"+++ b/src/auth.ts",
 	"@@ -1,3 +1,5 @@",
-	" import { hash } from \"./hash\";",
+	' import { hash } from "./hash";',
 	"+export function login() {",
 	"+  return hash(secret);",
 	"-  return legacy();",
@@ -100,7 +103,9 @@ describe("buildReviewPrompt", () => {
 
 		expect(prompt).toContain("### Excluded Files (3)");
 		expect(prompt).toContain("- `package-lock.json` (+3/-0) — lockfile");
-		expect(prompt).toContain("- `assets/logo.png` (+0/-0) — binary/media asset");
+		expect(prompt).toContain(
+			"- `assets/logo.png` (+0/-0) — binary/media asset",
+		);
 		expect(prompt).toContain("- `dist/app.min.js` (+1/-1) — minified asset");
 	});
 
@@ -154,6 +159,45 @@ describe("buildReviewPrompt", () => {
 		expect(prompt).toContain("Use `read` to inspect the changed files");
 		// No byte-truncated inline diff for oversized inputs.
 		expect(prompt).not.toContain("```diff");
+	});
+
+	test("switches to a file-list + read instruction for a >50KB diff, no truncation", () => {
+		// One file but a huge cleaned diff — crosses MAX_DIFF_BYTES (50_000).
+		const huge = [
+			"diff --git a/src/auth.ts b/src/auth.ts",
+			"--- a/src/auth.ts",
+			"+++ b/src/auth.ts",
+			...Array.from(
+				{ length: 26000 },
+				() => "+padding line to blow past the size threshold",
+			),
+		].join("\n");
+		const prompt = buildReviewPrompt(
+			task,
+			project,
+			"abc1234",
+			"feat: auth",
+			huge,
+		);
+
+		expect(prompt).toContain("Diff too large");
+		expect(prompt).toContain("Use `read` to inspect the changed files");
+		expect(prompt).toContain("src/auth.ts");
+		// No byte-truncated inline diff for the oversized input.
+		expect(prompt).not.toContain("```diff");
+	});
+
+	test("a small diff over the file-count branch still inlines under size threshold", () => {
+		// 5 files, small diff — under MAX_REVIEW_FILES and MAX_DIFF_BYTES → inlined.
+		const prompt = buildReviewPrompt(
+			task,
+			project,
+			"abc1234",
+			"feat: small",
+			manyFileDiff(5),
+		);
+		expect(prompt).toContain("```diff");
+		expect(prompt).not.toContain("Diff too large");
 	});
 
 	test("inlines a small diff normally (no read-instruction)", () => {
