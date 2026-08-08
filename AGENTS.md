@@ -126,9 +126,20 @@ Key config fields in `execution`:
   loop startup via `selectLoopOptions`; review is asked FIRST, commit is
   mandated when review is on)
 - `models` — slot-aware round-robin model list for parallel mode, with
-  automatic failover to the next model per task
+  failover to the next model per task (only after exhausting same-model
+  retries, see `maxSameModelAttempts`)
+- `maxSameModelAttempts` — max attempts on the SAME model before cycling to
+  the next model on failure (default 5, matching pi's normal retry count).
+  Applies to task execution, commit/review follow-up sessions, and
+  review-fix re-execution alike
 - `implModel` / `commitModel` / `reviewModel` — `<provider>/<model>` strings
   resolved via `resolveModelSpec` in `utils.ts`
+- `prompts.reviewFocus` — per-review custom focus/instructions, injected as a
+  `## Custom Review Focus` section in review prompts
+- `review.extraIgnorePatterns` — extra noise-filter exclusion regexes (file
+  paths) merged into the default rules
+- `review.ignorePaths` — pathspec allowlist keeping matching files in review
+  scope even when a default noise rule would exclude them
 - `maxReviewRetries` / `reviewBlockOnFail` — review-gated loop retry behavior
 - `worktrees` — `"never" | "parallel" | "always"` git worktree isolation
   (default `"parallel"`; see `shouldUseWorktrees` in `src/executor.ts`)

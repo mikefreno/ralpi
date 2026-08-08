@@ -221,7 +221,24 @@ execution:
 prompts:
   projectContext: "Additional context for all tasks"
   reflectionPrompt: ""        # custom suffix for reflection extraction
+  reviewFocus: ""             # per-review custom focus/instructions (e.g. "check security only")
+review:
+  extraIgnorePatterns: []     # extra noise-filter exclusion regexes (merged into the default rules)
+  ignorePaths: []             # pathspec allowlist — files matching these stay in review scope
 ```
+
+Review prompts (committed + uncommitted) run the diff through a noise filter
+before inlining: lockfiles, minified/generated assets, source maps,
+snapshots, build output, `node_modules`/`vendor`, and binary/media files are
+excluded by default. The prompt gets a per-file `+/−` summary table, an
+`### Excluded Files (n)` section listing what was filtered (path, counts,
+reason), and — when a diff is oversized or touches >20 files — a
+file-list + "use `read`" instruction instead of a byte-truncated diff.
+`prompts.reviewFocus` injects a `### Custom Review Focus` section into each
+review prompt. `review.extraIgnorePatterns` adds exclusion regexes (matched
+against file paths), and `review.ignorePaths` is a pathspec allowlist that
+keeps matching files in review scope even when a default rule would exclude
+them.
 
 > `execution.models` uses slot-aware round-robin: with 3 models and 2 concurrent
 > tasks, only the first two models are used. The third model is only touched when

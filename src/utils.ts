@@ -910,17 +910,46 @@ export function captureGitHead(projectDir: string): string | undefined {
  * made since the base reference. Used by the review-gated loop so the reviewer
  * sees the full task diff (all commits, not just the latest) across execution
  * attempts and re-execution fixes. `baseRef` must be a validated hex SHA from
- * captureGitHead(). Returns the short HEAD hash, HEAD subject, and range diff,
- * or null when git is unavailable / baseRef is invalid / no changes exist.
+ * captureGitHead().
+ *
+ * Returns a tri-state so the review loop can tell a FAILED range computation
+ * (invalid/stale base ref, git error) apart from a GENUINELY EMPTY range — a
+ * broken base must never be silently treated as a clean, verified task.
  */
+export type CommitRangeDiffResult =
+  | { kind: "ok"; hash: string; subject: string; diff: string }
+  | { kind: "no-changes" }
+  | { kind: "error"; error: string };
+
+/**
+ * Whether the `baseRef..HEAD` range can be computed — i.e. the base ref is a
+ * resolvable commit in this repo (mirrors @piex-dev/review's canCompareToBase).
+ * Only validated hex SHAs are passed to the shell.
+ */
+export function canComputeRange(projectDir: string, baseRef: string): boolean {
+  const { execSync } = require("node:child_process");
+  if (!/^[0-9a-f]{7,40}$/i.test(baseRef)) return false;
+  try {
+    execSync(`git rev-parse --verify ${baseRef}`, {
+      cwd: projectDir,
+      stdio: "pipe",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function getCommitRangeDiff(
   projectDir: string,
   baseRef: string,
-): { hash: string; subject: string; diff: string } | null {
+): CommitRangeDiffResult {
   const { execSync } = require("node:child_process");
 
   // Only pass validated hex SHAs to the shell.
-  if (!/^[0-9a-f]{7,40}$/i.test(baseRef)) return null;
+  if (!/^[0-9a-f]{7,40}$/i.test(baseRef)) {
+    return { kind: "error", error: "invalid or stale base ref" };
+  }
 
   try {
     execSync("git rev-parse --git-dir", {
@@ -928,7 +957,18 @@ export function getCommitRangeDiff(
       stdio: "pipe",
     });
   } catch {
-    return null;
+    return { kind: "error", error: "not a git repository" };
+  }
+
+  // Verify the base ref resolves before diffing — a stale/unfetched ref is a
+  // computation failure, not a clean "no changes" signal.
+  try {
+    execSync(`git rev-parse --verify ${baseRef}`, {
+      cwd: projectDir,
+      stdio: "pipe",
+    });
+  } catch {
+    return { kind: "error", error: `base ref ${baseRef} cannot be resolved` };
   }
 
   try {
@@ -946,17 +986,20 @@ export function getCommitRangeDiff(
     // the snapshot. Includes stat overview + full patch.
     //
     // maxBuffer is set high (10 MB) so larger tasks don't cause execSync to
-    // throw. The review prompt builder truncates to MAX_DIFF_BYTES (50 KB)
-    // before sending to the model, so the full diff in memory is fine.
+    // throw. The review prompt builder filters noise and inlines only under
+    // MAX_DIFF_BYTES, so the full diff in memory is fine.
     const diff = execSync(`git diff ${baseRef} HEAD --stat --patch`, {
       cwd: projectDir,
       encoding: "utf-8",
       maxBuffer: 10 * 1024 * 1024,
     }).trim();
 
-    if (!diff) return null; // no changes since baseRef
-    return { hash, subject, diff };
-  } catch {
-    return null;
+    if (!diff) return { kind: "no-changes" }; // genuinely no changes since baseRef
+    return { kind: "ok", hash, subject, diff };
+  } catch (error) {
+    return {
+      kind: "error",
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
 }

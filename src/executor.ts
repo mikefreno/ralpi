@@ -19,6 +19,10 @@ import {
 	buildConflictResolutionPrompt,
 	MAX_DIFF_BYTES,
 } from "./prompts";
+import {
+	compileIgnorePatterns,
+	type DiffOptions,
+} from "./diff";
 import { extractReflection } from "./reflection";
 import {
 	extractReview,
@@ -756,10 +760,20 @@ async function executeTask(
 	conflicts?: BatchConflict[],
 ): Promise<void> {
 	// Model failover: when a provider/API is down, cycle through available models.
-	// Pi's built-in retry (via SettingsManager) handles transient errors with
-	// exponential backoff within each model. Ralpi only handles model cycling.
+	// Pi's built-in retry (via SettingsManager) handles transient HTTP errors
+	// with exponential backoff WITHIN a single prompt. Ralpi adds two layers on
+	// top: (1) reattempt the SAME model up to `maxSameModelAttempts` times — a
+	// sustained provider hiccup can exhaust pi's in-call retries mid-session,
+	// and flapping to a different model on the first hard failure throws away
+	// model-specific context; (2) once same-model retries are exhausted, cycle
+	// to the next model in the round-robin pool.
 	const maxModelAttempts = roundRobin ? roundRobin.length : 1;
+	const maxSameModelAttempts = Math.max(
+		1,
+		config.execution.maxSameModelAttempts,
+	);
 	let modelAttempt = 0;
+	let sameModelAttempt = 0;
 	// Resolve implModel from config (used in sequential mode when no round-robin assignment).
 	// In parallel mode, the round-robin assignedModel takes precedence.
 	const implModel = resolveModelSpec(
@@ -787,12 +801,9 @@ async function executeTask(
 	const worktreeDir = wt?.dir ?? projectDir;
 
 	while (modelAttempt < maxModelAttempts) {
-		// On subsequent model attempts, advance to the next model.
-		// Uses advance() instead of assign() so we don't get stuck on
-		// the same freed slot when the current model is down.
-		if (modelAttempt > 0 && roundRobin) {
-			currentModel = roundRobin.advance(task.id);
-		}
+		// Model advancement happens in the cycling branch below (not here) so a
+		// same-model retry `continue` doesn't re-advance and accidentally swap
+		// models mid-retry. The first model uses `currentModel` set above.
 
 		try {
 			// Mark as in progress
@@ -897,19 +908,30 @@ async function executeTask(
 						// baseRef was captured before runTask (above). Each review iteration
 						// diffs the range baseRef..HEAD — the complete task output including
 						// all fix attempts. On re-execution the same baseRef is reused.
+						// A FAILED range computation (broken/stale base ref, git error) is
+						// logged as a distinct warning and is never treated as a clean,
+						// verified task — only a GENUINE "no changes" skips review.
 						while (true) {
-							const reviewInfo = baseRef
-								? getCommitRangeDiff(worktreeDir, baseRef)
-								: null;
-							if (!reviewInfo || !reviewInfo.diff) {
-								const reason = !baseRef
-									? "could not capture base ref before execution"
-									: "no changes found between base and HEAD";
+							if (!baseRef) {
 								sendChatMessage?.(
-									`~ review for ${task.id} · ${task.title} — skipping review (${reason})`,
+									`~ review for ${task.id} · ${task.title} — diff could not be computed (could not capture base ref before execution)`,
 								);
 								break;
 							}
+							const rangeDiff = getCommitRangeDiff(worktreeDir, baseRef);
+							if (rangeDiff.kind === "error") {
+								sendChatMessage?.(
+									`~ review for ${task.id} · ${task.title} — diff could not be computed (${rangeDiff.error})`,
+								);
+								break;
+							}
+							if (rangeDiff.kind === "no-changes") {
+								sendChatMessage?.(
+									`~ review for ${task.id} · ${task.title} — skipping review (no changes found between base and HEAD)`,
+								);
+								break;
+							}
+							const reviewInfo = rangeDiff;
 
 							const reviewPrompt = buildReviewPrompt(
 								task,
@@ -917,7 +939,16 @@ async function executeTask(
 								reviewInfo.hash,
 								reviewInfo.subject,
 								reviewInfo.diff,
-								config.prompts.projectContext,
+								{
+									projectContext: config.prompts.projectContext,
+									focus: config.prompts.reviewFocus,
+									diffOptions: {
+										extraPatterns: compileIgnorePatterns(
+											config.review.extraIgnorePatterns,
+										),
+										ignorePaths: config.review.ignorePaths,
+									},
+								},
 							);
 
 							const reviewModel = resolveFollowUpModel(
@@ -1049,19 +1080,33 @@ async function executeTask(
 								fixAttempt++
 							) {
 								const fixModel = fixModels[fixAttempt];
-								fixResult = await runTask(
-									task,
-									project,
-									config,
-									depReflections,
-									ctx,
-									sendChatMessage,
-									worktreeDir,
-									parallelState,
-									fixModel,
-									batchRender,
-									review ?? undefined,
-								);
+								let fixSameAttempt = 0;
+								// Reattempt on the same model before cycling, matching the main
+								// task loop's behavior.
+								for (;;) {
+									fixResult = await runTask(
+										task,
+										project,
+										config,
+										depReflections,
+										ctx,
+										sendChatMessage,
+										worktreeDir,
+										parallelState,
+										fixModel,
+										batchRender,
+										review ?? undefined,
+									);
+									if (fixResult.success) break;
+									if (fixSameAttempt < maxSameModelAttempts - 1) {
+										fixSameAttempt++;
+										sendChatMessage?.(
+											`~ re-execution for ${task.id} · ${task.title} — reattempting model ${fixAttempt + 1}/${fixModels.length} (${fixSameAttempt + 1}/${maxSameModelAttempts}, previous: ${fixResult.error})`,
+										);
+										continue;
+									}
+									break; // same-model retries exhausted
+								}
 								if (fixResult.success) break;
 								// Connection/error failover — try the next model.
 								if (fixAttempt < fixModels.length - 1) {
@@ -1226,9 +1271,22 @@ async function executeTask(
 			}
 
 			// Agent session failed (provider error).
-			// Pi's built-in retry already exhausted for this model. Cycle to the next.
+			// Pi's built-in in-call retry already exhausted for this attempt.
+			// Reattempt on the SAME model a few more times before cycling — a
+			// transient outage can outlast pi's per-prompt backoff window.
+			sameModelAttempt++;
+			if (sameModelAttempt < maxSameModelAttempts) {
+				sendChatMessage?.(
+					`~ ${task.id} · ${task.title} — reattempting model ${modelAttempt + 1}/${maxModelAttempts} (${sameModelAttempt + 1}/${maxSameModelAttempts}, previous: ${result.error})`,
+				);
+				continue; // same model, fresh session
+			}
+
+			// Same-model retries exhausted — cycle to the next model (if any).
 			if (roundRobin && modelAttempt < maxModelAttempts - 1) {
 				modelAttempt++;
+				sameModelAttempt = 0;
+				currentModel = roundRobin.advance(task.id);
 				sendChatMessage?.(
 					`~ ${task.id} · ${task.title} — cycling to model ${modelAttempt + 1}/${maxModelAttempts} (previous: ${result.error})`,
 				);
@@ -1417,28 +1475,43 @@ async function runFollowUpSession(
 	}, 100);
 
 	let result: Awaited<ReturnType<typeof runAgentSession>> | undefined;
+	const maxSameModelAttempts = Math.max(
+		1,
+		config.execution.maxSameModelAttempts,
+	);
 	try {
 		for (let attempt = 0; attempt < models.length; attempt++) {
 			const model = models[attempt];
-			result = await runAgentSession(
-				prompt,
-				projectDir,
-				timeoutMs,
-				(event) => {
-					if (event.type === "tool_execution_start") {
-						const label = formatToolArg(event.toolName, event.args);
-						toolCalls.push({ name: event.toolName, label });
-						requestRender();
-					}
-				},
-				undefined,
-				model,
-				config.thinkingLevel,
-				false, // noSkills=false — follow-up sessions load skills too
-				(ctx.modelRegistry as any).runtime as ModelRuntime,
-			);
+			// Reattempt on the same model before cycling — matches the main task
+			// loop. Clear partial tool calls between failed attempts so the
+			// widget reflects only the successful (or final) attempt.
+			for (let same = 0; same < maxSameModelAttempts; same++) {
+				result = await runAgentSession(
+					prompt,
+					projectDir,
+					timeoutMs,
+					(event) => {
+						if (event.type === "tool_execution_start") {
+							const label = formatToolArg(event.toolName, event.args);
+							toolCalls.push({ name: event.toolName, label });
+							requestRender();
+						}
+					},
+					undefined,
+					model,
+					config.thinkingLevel,
+					false, // noSkills=false — follow-up sessions load skills too
+					(ctx.modelRegistry as any).runtime as ModelRuntime,
+				);
 
-			if (result.success) break;
+				if (result.success) break;
+				if (same < maxSameModelAttempts - 1) {
+					toolCalls.length = 0;
+					requestRender();
+				}
+			}
+
+			if (result!.success) break;
 
 			// If there's a next model to try, cycle; otherwise give up.
 			if (attempt < models.length - 1) {

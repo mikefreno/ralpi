@@ -1,27 +1,34 @@
 import type { Task, Project, Reflection, ReviewResult } from "./types";
 import { readTaskSpec } from "./parser";
+import {
+	parseDiff,
+	filterNoise,
+	type DiffSummary,
+	type DiffOptions,
+} from "./diff";
 
-/** Maximum bytes of a commit diff embedded in a review/commit prompt.
- *  Diffs larger than this are truncated to avoid blowing past the model's
- *  context window. The agent can always run `git show HEAD` itself to
- *  inspect the full diff when it needs more detail.
+/** Maximum bytes of an inlined review diff before we stop inlining it and
+ *  instead list the changed files + tell the model to `read` them.
+ *  Diffs larger than this are never byte-truncated into a review prompt —
+ *  truncation loses the middle of a large diff, so the file-list + read
+ *  instruction is strictly better.
  *
  *  ~50 KB ≈ 12.5K tokens — comfortably fits even on models with a 128K
  *  context window once system-prompt overhead is accounted for. */
 export const MAX_DIFF_BYTES = 50_000;
 
-/**
- * Truncate a diff to MAX_DIFF_BYTES, appending a clear notice when truncated.
- */
-function truncateDiff(diff: string): string {
-	if (diff.length <= MAX_DIFF_BYTES) return diff;
-	const omitted = diff.length - MAX_DIFF_BYTES;
-	return (
-		diff.slice(0, MAX_DIFF_BYTES) +
-		"\n\n... (diff truncated: omitted " +
-		omitted.toLocaleString() +
-		" bytes; run `git show HEAD` to view the full diff)"
-	);
+/** Max included files before an oversized diff is replaced by a read
+ *  instruction rather than inlined. */
+const MAX_REVIEW_FILES = 20;
+
+/** Optional knobs for the review prompt builders. */
+export interface ReviewPromptOptions {
+	/** Extra context injected into the prompt (config.prompts.projectContext). */
+	projectContext?: string;
+	/** Per-review custom focus/instructions (config.prompts.reviewFocus). */
+	focus?: string;
+	/** Noise-filter overrides (config.review.*). */
+	diffOptions?: DiffOptions;
 }
 
 // ─── Task Prompt ─────────────────────────────────────────────────────────────
@@ -201,7 +208,7 @@ export function buildReviewPrompt(
 	commitHash: string,
 	commitSubject: string,
 	commitDiff: string,
-	projectContext?: string,
+	opts: ReviewPromptOptions = {},
 ): string {
 	const parts: string[] = [];
 
@@ -236,17 +243,34 @@ export function buildReviewPrompt(
 	parts.push("## Commit Under Review");
 	parts.push(`Commit: ${commitHash} — ${commitSubject}`);
 	parts.push("");
-	parts.push("### Diff");
-	parts.push("```diff");
-	parts.push(truncateDiff(commitDiff));
-	parts.push("```");
+
+	// ── Changed-Files Summary + Exclusions (noise-filtered scope) ──
+
+	const summary = parseDiff(commitDiff, opts.diffOptions);
+	const filtered = filterNoise(commitDiff, opts.diffOptions);
+	parts.push(buildFileSummaryTable(summary));
+	const excluded = renderExcludedFiles(summary);
+	if (excluded) parts.push(excluded);
 	parts.push("");
+
+	// ── Diff (inline, or file-list + read instruction when oversized) ──
+
+	parts.push(renderDiffSection(summary, filtered, "### Diff"));
+	parts.push("");
+
+	// ── Custom Review Focus ──
+
+	if (opts.focus) {
+		parts.push("## Custom Review Focus");
+		parts.push(opts.focus);
+		parts.push("");
+	}
 
 	// ── Project Context ──
 
-	if (projectContext) {
+	if (opts.projectContext) {
 		parts.push("## Additional Context");
-		parts.push(projectContext);
+		parts.push(opts.projectContext);
 		parts.push("");
 	}
 
@@ -254,7 +278,7 @@ export function buildReviewPrompt(
 
 	parts.push("## Review Instructions");
 	parts.push(
-		"Review the commit above against the task description. Check for:",
+		"Review the changes above against the task description. Check for:",
 	);
 	parts.push(...reviewInstructions());
 	parts.push("");
@@ -279,7 +303,7 @@ export function buildReviewPromptUncommitted(
 	project: Project,
 	status: string,
 	diff: string,
-	projectContext?: string,
+	opts: ReviewPromptOptions = {},
 ): string {
 	const parts: string[] = [];
 
@@ -321,17 +345,36 @@ export function buildReviewPromptUncommitted(
 	parts.push(status || "(no status output)");
 	parts.push("```");
 	parts.push("");
-	parts.push("### Current Tracked Diff (git diff)");
-	parts.push("```diff");
-	parts.push(truncateDiff(diff) || "(no tracked diff output)");
-	parts.push("```");
+
+	// ── Changed-Files Summary + Exclusions (noise-filtered scope) ──
+
+	const summary = parseDiff(diff, opts.diffOptions);
+	const filtered = filterNoise(diff, opts.diffOptions);
+	parts.push(buildFileSummaryTable(summary));
+	const excluded = renderExcludedFiles(summary);
+	if (excluded) parts.push(excluded);
 	parts.push("");
+
+	// ── Diff (inline, or file-list + read instruction when oversized) ──
+
+	parts.push(
+		renderDiffSection(summary, filtered, "### Current Tracked Diff (git diff)"),
+	);
+	parts.push("");
+
+	// ── Custom Review Focus ──
+
+	if (opts.focus) {
+		parts.push("## Custom Review Focus");
+		parts.push(opts.focus);
+		parts.push("");
+	}
 
 	// ── Project Context ──
 
-	if (projectContext) {
+	if (opts.projectContext) {
 		parts.push("## Additional Context");
-		parts.push(projectContext);
+		parts.push(opts.projectContext);
 		parts.push("");
 	}
 
@@ -354,6 +397,78 @@ export function buildReviewPromptUncommitted(
 
 // ─── Shared Review Prompt Helpers ───────────────────────────────────────────
 
+/** Whether an oversized/wide diff should be replaced by a file-list + read
+ *  instruction instead of being inlined. Thresholds: cleaned diff over
+ *  MAX_DIFF_BYTES, or more than MAX_REVIEW_FILES included files. */
+function shouldSkipInline(summary: DiffSummary, filteredLength: number): boolean {
+	return (
+		filteredLength > MAX_DIFF_BYTES || summary.files.length > MAX_REVIEW_FILES
+	);
+}
+
+/**
+ * Render a per-file +/− summary Markdown table (with type column and a total
+ * line) from a parsed diff. Handles the empty/all-noise diff gracefully — an
+ * empty table with zero totals, no crash.
+ */
+function buildFileSummaryTable(summary: DiffSummary): string {
+	const lines: string[] = [];
+	lines.push("### Changed Files");
+	lines.push("");
+	lines.push("| File | +/− | Type |");
+	lines.push("|------|-----|------|");
+	if (summary.files.length === 0) {
+		lines.push("| _(no included changes)_ | — | — |");
+	} else {
+		for (const f of summary.files) {
+			lines.push(
+				`| \`${f.path}\` | +${f.linesAdded}/-${f.linesRemoved} | ${f.ext || "—"} |`,
+			);
+		}
+	}
+	lines.push(`| **Total** | **+${summary.totalAdded}/-${summary.totalRemoved}** | |`);
+	return lines.join("\n");
+}
+
+/**
+ * Render the `### Excluded Files (n)` bullet list (path, +/− counts, reason).
+ * Returns an empty string when there are no exclusions so callers omit the
+ * section entirely (no empty heading).
+ */
+function renderExcludedFiles(summary: DiffSummary): string {
+	if (summary.excluded.length === 0) return "";
+	const lines: string[] = [];
+	lines.push(`### Excluded Files (${summary.excluded.length})`);
+	lines.push("");
+	for (const f of summary.excluded) {
+		lines.push(
+			`- \`${f.path}\` (+${f.linesAdded}/-${f.linesRemoved}) — ${f.reason}`,
+		);
+	}
+	return lines.join("\n");
+}
+
+/**
+ * Render the diff section of a review prompt. Under the threshold, inline the
+ * noise-filtered diff. Over the threshold (size or file count), emit a
+ * file-list + read-instruction notice and never byte-truncate the diff.
+ */
+function renderDiffSection(
+	summary: DiffSummary,
+	filtered: string,
+	heading: string,
+): string {
+	if (shouldSkipInline(summary, filtered.length)) {
+		return `${heading} — _Diff too large (${filtered.length.toLocaleString()} chars, ${summary.files.length} files). Use \`read\` to inspect the changed files._`;
+	}
+	const lines: string[] = [];
+	lines.push(heading);
+	lines.push("```diff");
+	lines.push(filtered || "(no included changes)");
+	lines.push("```");
+	return lines.join("\n");
+}
+
 function reviewInstructions(): string[] {
 	return [
 		"- **Correctness**: Does the implementation fulfill the task requirements?",
@@ -373,7 +488,7 @@ function reviewVerdictBlock(): string[] {
 		"VERDICT: [pass | warn | fail]",
 		"SUMMARY: [1-2 sentence overall assessment]",
 		"FINDINGS:",
-		"- [blocker] file:line description  (use severity: blocker|warning|nit|info)",
+		"- [blocker] file:line description  (use severity: blocker|warning|nit|info; `critical` is accepted as a blocker synonym)",
 		"- [warning] file:line description",
 		"```",
 		"",
@@ -387,7 +502,8 @@ function reviewVerdictBlock(): string[] {
 		"",
 		"Each FINDINGS line uses the form `- [severity] [file:line] message`.",
 		"The `file:line` part is optional. Severity must be one of:",
-		"`blocker`, `warning`, `nit`, `info`.",
+		"`blocker`, `warning`, `nit`, `info`. The `critical` token is accepted",
+		"and treated as `blocker`.",
 	];
 }
 

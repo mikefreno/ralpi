@@ -88,13 +88,16 @@ function extractFindings(block: string): ReviewFinding[] {
 		.filter(Boolean);
 
 	const findings: ReviewFinding[] = [];
-	const severityRe = /^\[(blocker|warning|warn|nit|info)\]\s*(.*)$/i;
+	// `critical` is accepted and normalized to ralpi's `blocker` severity,
+	// providing parity with @piex-dev/review's critical/warning/info grading.
+	const severityRe = /^\[(blocker|critical|warning|warn|nit|info)\]\s*(.*)$/i;
 
 	for (const line of lines) {
 		const sm = line.match(severityRe);
 		if (sm) {
 			let sev = sm[1].toLowerCase();
 			if (sev === "warn") sev = "warning";
+			else if (sev === "critical") sev = "blocker";
 			const rest = sm[2].trim();
 			const { file, line: lineNum, message } = parseFileRef(rest);
 			findings.push({

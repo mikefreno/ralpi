@@ -246,6 +246,16 @@ export interface RalpiConfig {
 		reviewBlockOnFail: boolean;
 		/** Maximum total duration for the entire loop execution in milliseconds (0 = no limit). Checked between batches — in-progress tasks finish naturally. */
 		loopTimeoutMs: number;
+		/** Max attempts on the SAME model before cycling to the next model on
+		 *  failure. Pi retries transient HTTP errors within a single prompt,
+		 *  but a sustained provider hiccup can still exhaust those in-call
+		 *  retries mid-session. Re-running the whole session a few times on
+		 *  the same model avoids flapping to a different model (and losing
+		 *  model-specific context) on the first hard failure. Applies to task
+		 *  execution, commit/review follow-up sessions, and review-fix
+		 *  re-execution alike. After this many attempts on one model, ralpi
+		 *  advances to the next model in the round-robin pool. */
+		maxSameModelAttempts: number;
 		/** Isolate each task in a separate git worktree so parallel tasks can't
 		 *  stomp each other's files, and review/commit see a clean single-task diff.
 		 *  - "never":   all tasks run in the shared working tree (default, backward compat)
@@ -258,6 +268,18 @@ export interface RalpiConfig {
 		projectContext: string;
 		/** Custom prompt suffix for reflection extraction */
 		reflectionPrompt: string;
+		/** Per-review custom focus/instructions (e.g. "check security only").
+		 *  Injected as a `### Custom Review Focus` section in committed and
+		 *  uncommitted review prompts when non-empty. */
+		reviewFocus: string;
+	};
+	review: {
+		/** Extra noise-filter exclusion regexes (strings compiled to RegExp),
+		 *  merged into EXCLUDED_PATTERNS for review diffs. */
+		extraIgnorePatterns: string[];
+		/** Pathspec allowlist — files matching these stay in scope even when a
+		 *  default noise rule would exclude them. */
+		ignorePaths: string[];
 	};
 	/** Parent session model to inherit in child agent sessions */
 	model?: unknown;
@@ -287,9 +309,15 @@ export const DEFAULT_CONFIG: RalpiConfig = {
 		reviewBlockOnFail: false, // false = commit anyway after retries exhausted
 		loopTimeoutMs: 0, // 0 = no limit
 		worktrees: "parallel", // worktree isolation for parallel tasks by default
+		maxSameModelAttempts: 5, // retry the same model up to 5 times before cycling to the next
 	},
 	prompts: {
 		projectContext: "",
 		reflectionPrompt: "",
+		reviewFocus: "",
+	},
+	review: {
+		extraIgnorePatterns: [],
+		ignorePaths: [],
 	},
 };
