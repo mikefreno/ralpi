@@ -34,12 +34,46 @@ import {
 	deleteLoopActive,
 	readLoopActive,
 	findRalpiDir,
+	ensureRalpiIgnored,
 	listPRDsSorted,
 	countPRDResumeStats,
 	formatDuration,
 } from "./src/utils";
 
 type ExecutionMode = "parallel" | "sequential";
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Split a `--no-gitignore` opt-out out of the command args (in place). The
+ * flag controls whether `/ralpi run|resume|reset` auto-adds `.ralpi/` to the
+ * project's `.gitignore` — it defaults to on so ralpi's own artifacts never
+ * end up staged in the user's repo.
+ */
+function stripNoGitignore(args: string[]): boolean {
+	const i = args.indexOf("--no-gitignore");
+	if (i === -1) return false;
+	args.splice(i, 1);
+	return true;
+}
+
+/**
+ * Ensure `.ralpi/` is gitignored in the project (unless opted out), and
+ * notify once when the guard actually appended the entry.
+ */
+function ensureIgnoredNote(
+	projectDir: string,
+	ctx: ExtensionContext,
+	noGitignore = false,
+): void {
+	if (noGitignore) return;
+	if (ensureRalpiIgnored(projectDir)) {
+		ctx.ui.notify(
+			"· .ralpi/ added to .gitignore (opt out with --no-gitignore)",
+			"info",
+		);
+	}
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -558,6 +592,10 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 		const loopState = readLoopActive(projectDir);
 		if (!loopState) return;
 
+		// The auto-resume path has no CLI flag, so the gitignore guard is
+		// always on: keep `.ralpi/` out of the user's repo on reload too.
+		ensureRalpiIgnored(projectDir);
+
 		// Load progress state
 		const progressPath = path.join(projectDir, ".ralpi", "progress.json");
 
@@ -885,6 +923,7 @@ async function handleRun(
 	parentModel?: unknown,
 	parentThinkingLevel?: unknown,
 ): Promise<void> {
+	const noGitignore = stripNoGitignore(args);
 	const taskFile = resolveTaskArg(args[0] || "README.md", ctx.cwd);
 
 	// If targeting a specific task file and there's existing progress for it,
@@ -921,6 +960,7 @@ async function handleRun(
 	}
 
 	const projectDir = found ? path.dirname(path.dirname(found.path)) : ctx.cwd;
+	ensureIgnoredNote(projectDir, ctx, noGitignore);
 
 	const project = parseTaskFile(taskFile);
 	const config = loadConfig(projectDir);
@@ -1200,6 +1240,7 @@ async function handleResume(
 	parentModel?: unknown,
 	parentThinkingLevel?: unknown,
 ): Promise<void> {
+	const noGitignore = stripNoGitignore(args);
 	let taskFile: string;
 	let projectDir: string;
 	let prdKey: string | undefined;
@@ -1266,6 +1307,8 @@ async function handleResume(
 		return undefined;
 	})();
 
+	ensureIgnoredNote(projectDir, ctx, noGitignore);
+
 	await resumeLoop(
 		ctx,
 		taskFile,
@@ -1287,6 +1330,7 @@ async function handleReset(
 	ctx: ExtensionContext,
 	args: string[],
 ): Promise<void> {
+	const noGitignore = stripNoGitignore(args);
 	let sourcePath: string;
 	let prdKey: string | undefined;
 	let progress: ProgressTracker;
@@ -1295,6 +1339,7 @@ async function handleReset(
 		const taskFile = resolveTaskArg(args[0], ctx.cwd);
 		const found = findProgressFile(ctx.cwd, taskFile);
 		const projectDir = found ? path.dirname(path.dirname(found.path)) : ctx.cwd;
+		ensureIgnoredNote(projectDir, ctx, noGitignore);
 		sourcePath = taskFile;
 		prdKey = found?.prdKey;
 		progress = new ProgressTracker(projectDir, taskFile, prdKey);
@@ -1308,6 +1353,8 @@ async function handleReset(
 			return;
 		}
 		const projectDir = path.dirname(path.dirname(found.path));
+
+		ensureIgnoredNote(projectDir, ctx, noGitignore);
 
 		// Multiple loops may have progress — let the user select which one to
 		// reset (sorted by most recent first), same as resume.

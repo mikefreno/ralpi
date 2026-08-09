@@ -100,6 +100,49 @@ export function deleteLoopActive(projectDir: string): void {
   }
 }
 
+// ─── Git Hygiene ────────────────────────────────────────────────────────────
+
+const ralpiIgnoreMemo = new Set<string>();
+
+/**
+ * Ensure `.ralpi/` is excluded from the project's `.gitignore` so ralpi's own
+ * run-state, worktrees, and reviews never show up as tracked/untracked files
+ * in the user's repo.
+ *
+ * Memoized per project dir; only acts inside a git work tree (`.git` may be a
+ * directory or, in linked worktrees, a file). Creates or appends `.ralpi/` to
+ * `.gitignore`, best-effort: any failure returns `false` (never throws).
+ *
+ * @returns true when the ignore entry was newly added, false otherwise.
+ */
+export function ensureRalpiIgnored(projectDir: string): boolean {
+  if (ralpiIgnoreMemo.has(projectDir)) return false;
+  ralpiIgnoreMemo.add(projectDir);
+  try {
+    // Only act inside a git work tree (works for worktrees too: .git is a file).
+    fs.statSync(path.join(projectDir, ".git"));
+    const ignorePath = path.join(projectDir, ".gitignore");
+    const marker = ".ralpi/";
+    let content: string;
+    try {
+      content = fs.readFileSync(ignorePath, "utf8");
+    } catch {
+      fs.writeFileSync(ignorePath, `${marker}\n`, "utf8");
+      return true;
+    }
+    if (content.split(/\r?\n/).some((l) => l.trim() === marker)) return false;
+    const prefix = content.endsWith("\n") ? "" : "\n";
+    fs.appendFileSync(
+      ignorePath,
+      `${prefix}# ralpi run-state, worktrees, and reviews\n${marker}\n`,
+      "utf8",
+    );
+    return true;
+  } catch {
+    return false; // not a git work tree, or a best-effort write failed
+  }
+}
+
 /**
  * Discover the project directory by walking up to find `.ralpi/`.
  */

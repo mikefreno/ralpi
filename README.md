@@ -290,3 +290,9 @@ in parallel mode).
 .ralpi/prompts/                # Generated prompts (timestamped, for debugging)
 .ralpi/config.yaml             # Project-level config (optional)
 ```
+
+Every `/ralpi run`, `/ralpi resume`, and `/ralpi reset` (plus the auto-resume
+on session reload) ensures `.ralpi/` is present in the project's `.gitignore`,
+so ralpi's own artifacts never show up as untracked/staged files in the user's
+repo. Opt out per command with `--no-gitignore` (e.g. `/ralpi-run README.md
+--no-gitignore`).
