@@ -930,7 +930,10 @@ export function canComputeRange(projectDir: string, baseRef: string): boolean {
   const { execSync } = require("node:child_process");
   if (!/^[0-9a-f]{7,40}$/i.test(baseRef)) return false;
   try {
-    execSync(`git rev-parse --verify ${baseRef}`, {
+    // git cat-file -e truly verifies the object EXISTS (rev-parse --verify
+    // accepts any 40-hex SHA even if it was never created), so a stale/broken
+    // base ref is caught here rather than silently treated as no-changes.
+    execSync(`git cat-file -e ${baseRef}`, {
       cwd: projectDir,
       stdio: "pipe",
     });
@@ -961,9 +964,11 @@ export function getCommitRangeDiff(
   }
 
   // Verify the base ref resolves before diffing — a stale/unfetched ref is a
-  // computation failure, not a clean "no changes" signal.
+  // computation failure, not a clean "no changes" signal. git cat-file -e
+  // checks the object genuinely exists (rev-parse --verify would accept any
+  // 40-hex SHA even if it was never created).
   try {
-    execSync(`git rev-parse --verify ${baseRef}`, {
+    execSync(`git cat-file -e ${baseRef}`, {
       cwd: projectDir,
       stdio: "pipe",
     });

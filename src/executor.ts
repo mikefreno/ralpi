@@ -19,10 +19,7 @@ import {
 	buildConflictResolutionPrompt,
 	MAX_DIFF_BYTES,
 } from "./prompts";
-import {
-	compileIgnorePatterns,
-	type DiffOptions,
-} from "./diff";
+import { compileIgnorePatterns } from "./diff";
 import { extractReflection } from "./reflection";
 import {
 	extractReview,
@@ -49,6 +46,7 @@ import {
 	ensureDir,
 	captureGitCommits,
 	captureGitHead,
+	canComputeRange,
 	getCommitRangeDiff,
 	hasUncommittedChanges,
 	getGitStatusPorcelain,
@@ -915,6 +913,15 @@ async function executeTask(
 							if (!baseRef) {
 								sendChatMessage?.(
 									`~ review for ${task.id} · ${task.title} — diff could not be computed (could not capture base ref before execution)`,
+								);
+								break;
+							}
+							// Cheap guard mirroring canCompareToBase: if the captured base ref no
+							// longer resolves (stale/broken worktree ref), warn explicitly and
+							// never treat the task as review-verified.
+							if (!canComputeRange(worktreeDir, baseRef)) {
+								sendChatMessage?.(
+									`~ review for ${task.id} · ${task.title} — diff could not be computed (base ref ${baseRef} no longer resolves)`,
 								);
 								break;
 							}
