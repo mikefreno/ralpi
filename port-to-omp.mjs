@@ -204,6 +204,19 @@ function transformPkg() {
   const ordered = reorder(raw, rule.order);
   return JSON.stringify(ordered, null, 2) + "\n";
 }
+const README_STUB = `# ralpi (omp port)
+
+Execute tasks from task files using DAG-based dependency resolution.
+
+## Install
+
+\`\`\`sh
+omp install @mikefreno/omp-ralpi
+\`\`\`
+
+This is the omp port of [Mike/ralpi](https://git.freno.me/Mike/ralpi), regenerated automatically from the source repo. See the source repo for full documentation.
+`;
+
 const FILE_RULES = {
     "src/utils.ts": [
       {
@@ -272,14 +285,7 @@ const FILE_RULES = {
         label: "vendor stripFrontmatter",
       },
     ],
-    "README.md": [
-      {
-        from: "pi install npm:@mikefreno/ralpi",
-        to: "# omp auto-discovers extensions in ~/.omp/agent/extensions/<name>/\ngit clone <repo> ~/.omp/agent/extensions/ralpi/",
-        label: "install block",
-      },
-      { from: "~/.pi/ralpi/config.yaml", to: "~/.omp/ralpi/config.yaml", all: true, label: "config path" },
-    ],
+
   };
 
 // ─── main ───────────────────────────────────────────────────────────────────
@@ -308,6 +314,8 @@ function portExtension() {
       writeFileSync(p, text);
     } else if (rel === "package.json") {
       writeFileSync(p, transformPkg());
+    } else if (rel === "README.md") {
+      writeFileSync(p, README_STUB);
     } else if (rel.endsWith(".md")) {
       let text = readFileSync(p, "utf8");
       if (FILE_RULES[rel]) text = applyOps(text, FILE_RULES[rel], rel);
