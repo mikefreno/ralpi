@@ -21,10 +21,11 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, relative, resolve, isAbsolute, dirname, basename } from "node:path";
 import { execSync } from "node:child_process";
 import { homedir } from "node:os";
 
@@ -113,7 +114,33 @@ function mirrorTree(srcDir, dstDir) {
   }
 }
 
-function walk(dir) {
+function real(p) {
+  try {
+    return realpathSync(p);
+  } catch {
+    // walk to the nearest existing ancestor and realpath it, then re-append
+    const tail = [];
+    let cur = resolve(p);
+    for (;;) {
+      try {
+        return join(realpathSync(cur), ...tail);
+      } catch {}
+      const parent = dirname(cur);
+      if (parent === cur) return resolve(p);
+      tail.unshift(basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+function assertDstOutsideSrc(srcDir, dstDir) {
+  const rel = relative(real(srcDir), real(dstDir));
+  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
+    throw new Error(
+      `refusing to port into a subdirectory of the source: ${dstDir} is inside ${srcDir}`
+    );
+  }
+}function walk(dir) {
   const out = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (SKIP.has(entry.name)) continue;
@@ -267,6 +294,7 @@ function portExtension() {
   if (!dstDir) throw new Error("--out requires a directory argument");
   if (!existsSync(srcDir)) throw new Error(`no base extension at ${srcDir}`);
 
+  assertDstOutsideSrc(srcDir, dstDir);
   console.log(`== ${srcDir} -> ${dstDir}`);
   mirrorTree(srcDir, dstDir);
 

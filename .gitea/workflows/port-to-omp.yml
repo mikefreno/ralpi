@@ -32,24 +32,28 @@ jobs:
         run: |
           set -euo pipefail
           URL="https://oauth2:${PORTING_TOKEN}@git.freno.me/Mike/${OMP_REPO}.git"
+          # The omp checkout lives in $RUNNER_TEMP, outside the pi checkout:
+          # the port script refuses to write into a subdirectory of its own
+          # source (cpSync would recurse into itself).
+          PORT_DIR="${RUNNER_TEMP:-/tmp}/omp-port"
 
           if git ls-remote "$URL" HEAD >/dev/null 2>&1; then
-            git clone --depth 1 "$URL" omp-port
-            git -C omp-port config user.name  "omp-port"
-            git -C omp-port config user.email "omp-port@freno.me"
+            git clone --depth 1 "$URL" "$PORT_DIR"
+            git -C "$PORT_DIR" config user.name  "omp-port"
+            git -C "$PORT_DIR" config user.email "omp-port@freno.me"
           else
-            git init -b main omp-port
-            git -C omp-port remote add origin "$URL"
-            git -C omp-port config user.name  "omp-port"
-            git -C omp-port config user.email "omp-port@freno.me"
+            git init -b main "$PORT_DIR"
+            git -C "$PORT_DIR" remote add origin "$URL"
+            git -C "$PORT_DIR" config user.name  "omp-port"
+            git -C "$PORT_DIR" config user.email "omp-port@freno.me"
           fi
 
           # Regenerate the port directly into the omp checkout. The script
           # preserves .git, asserts every patch rule, and runs `bun install`
           # (refreshing bun.lock + node_modules).
-          bun "$GITHUB_WORKSPACE/port-to-omp.mjs" --out "$PWD/omp-port"
+          bun "$GITHUB_WORKSPACE/port-to-omp.mjs" --out "$PORT_DIR"
 
-          cd omp-port
+          cd "$PORT_DIR"
           # The port must compile against the pinned @oh-my-pi SDK before it
           # ships to users.
           bun run typecheck
