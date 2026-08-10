@@ -24,7 +24,6 @@
   "files": [
     "index.ts",
     "src/",
-    "skills/",
     "prompts/",
     "README.md",
     "LICENSE"
@@ -40,9 +39,6 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ],
-    "skills": [
-      "./skills"
     ],
     "prompts": [
       "./prompts"

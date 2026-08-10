@@ -62,7 +62,6 @@ is unavailable).
   - `constants.ts` — static constants (slash command, task file names,
     reflection/review patterns)
 - `tests/` — bun test suites for parser and DAG behavior
-- `skills/ralpi-use.md` — Pi skill definition for task execution
 - `prompts/task-manager.md` — Pi prompt for task planning
 
 ## Runtime state
