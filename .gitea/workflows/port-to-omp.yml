@@ -4,7 +4,7 @@ name: port-to-omp
 #
 # Prerequisites on git.freno.me:
 #   - an access token with write:repository scope, stored as the repo/org
-#     secret GITEA_TOKEN (the workflow authenticates as `oauth2:<token>` over
+#     secret PORTING_TOKEN (the workflow authenticates as `oauth2:<token>` over
 #     https)
 #   - a registered Actions runner (act_runner) for this repo
 #
@@ -27,11 +27,11 @@ jobs:
 
       - name: Port to omp
         env:
-          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          PORTING_TOKEN: ${{ secrets.PORTING_TOKEN }}
           OMP_REPO: omp-ralpi
         run: |
           set -euo pipefail
-          URL="https://oauth2:${GITEA_TOKEN}@git.freno.me/Mike/${OMP_REPO}.git"
+          URL="https://oauth2:${PORTING_TOKEN}@git.freno.me/Mike/${OMP_REPO}.git"
 
           if git ls-remote "$URL" HEAD >/dev/null 2>&1; then
             git clone --depth 1 "$URL" omp-port
