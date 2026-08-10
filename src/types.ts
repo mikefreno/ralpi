@@ -262,6 +262,12 @@ export interface RalpiConfig {
 		 *  - "parallel": only when maxParallel > 1 and mode is parallel
 		 *  - "always":  every task gets its own worktree */
 		worktrees: "always" | "parallel" | "never";
+		/** Chat rendering style for tool calls during task execution.
+		 *  - "compact": single completion message per task with an expandable
+		 *    tool-call tree (collapsed shows last 3, expanded shows all).
+		 *  - "verbose": per-event stream — each tool start/end and assistant
+		 *    turn is its own chat line (piolium/pygienium-style). */
+		chatStyle: "compact" | "verbose";
 	};
 	prompts: {
 		/** Additional context injected into every task prompt */
@@ -310,6 +316,7 @@ export const DEFAULT_CONFIG: RalpiConfig = {
 		loopTimeoutMs: 0, // 0 = no limit
 		worktrees: "parallel", // worktree isolation for parallel tasks by default
 		maxSameModelAttempts: 5, // retry the same model up to 5 times before cycling to the next
+		chatStyle: "compact", // compact = completion message with tool-call tree; verbose = per-event stream
 	},
 	prompts: {
 		projectContext: "",

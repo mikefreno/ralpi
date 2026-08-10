@@ -218,6 +218,7 @@ execution:
   reviewTimeoutMs: 0          # timeout for auto-review agent sessions (0 = inherit)
   loopTimeoutMs: 0            # max total loop duration in ms (0 = no limit; checked between batches)
   worktrees: parallel         # "never" | "parallel" (default) | "always" — git worktree isolation
+  chatStyle: compact          # "compact" (default) | "verbose" — per-event tool-call stream
 prompts:
   projectContext: "Additional context for all tasks"
   reflectionPrompt: ""        # custom suffix for reflection extraction
@@ -250,6 +251,10 @@ them.
 > **NOTE**: model lists are only used in parallel execution. In sequential mode
 > (or parallel mode with no `models` list) the parent pi session's model is used,
 > unless `implModel` is set.
+
+> `execution.chatStyle` controls how sub-agent tool calls appear in the chat during task execution:
+> - **compact** (default): a single completion message per task with an expandable tool-call tree (collapsed shows the last 3 calls, expanded via Ctrl+O shows all).
+> - **verbose**: each tool event is streamed live as its own chat line (`[01 · task-name] → bash ...` / `← (ok)`), like piolium/pygienium's per-event stream.
 
 #### Auto-review and Auto-commit
 

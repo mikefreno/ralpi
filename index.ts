@@ -19,7 +19,7 @@ import { loadTaskManagerPrompt } from "./src/task-manager-prompt";
 import { formatReflections } from "./src/reflection";
 import { verdictGlyph, verdictSummary, formatFindings } from "./src/review";
 import type { ReviewResult } from "./src/types";
-import { executeBatch, type SendChatMessage } from "./src/executor";
+import { executeBatch, type SendChatMessage, setStreamForwarder } from "./src/executor";
 import {
 	cleanupStaleWorktrees,
 	finalizeCommittedWorktrees,
@@ -469,9 +469,134 @@ function makeSendProgress(pi: ExtensionAPI): SendChatMessage {
 	};
 }
 
+/** Pick the one useful argument from a tool-call's args (path/command/…). */
+function summarizeArgs(args: unknown): string {
+	if (!args || typeof args !== "object") return "";
+	const obj = args as Record<string, unknown>;
+	const pickKey = ["file_path", "path", "command", "pattern", "query", "url"].find(
+		(k) => typeof obj[k] === "string",
+	);
+	if (pickKey) {
+		const value = String(obj[pickKey]);
+		return value.length > 120 ? `${value.slice(0, 117)}…` : value;
+	}
+	const json = JSON.stringify(obj);
+	return json.length > 120 ? `${json.slice(0, 117)}…` : json;
+}
+
+/** Collapse a tool result down to a single short line. */
+function summarizeToolResult(result: unknown): string {
+	if (result == null) return "";
+	if (typeof result === "string") return result;
+	if (typeof result === "number" || typeof result === "boolean")
+		return String(result);
+	if (Array.isArray(result)) {
+		return result
+			.map((item) => {
+				if (typeof item === "string") return item;
+				if (
+					item &&
+					typeof item === "object" &&
+					"text" in (item as Record<string, unknown>)
+				)
+					return String((item as { text?: unknown }).text ?? "");
+				return JSON.stringify(item);
+			})
+			.join("\n");
+	}
+	if (typeof result !== "object") return "";
+	const obj = result as Record<string, unknown>;
+	if (Array.isArray(obj.content)) {
+		const unwrapped = summarizeToolResult(obj.content);
+		if (unwrapped) return unwrapped;
+	}
+	const preferKey = ["stdout", "output", "text", "content", "result"].find(
+		(k) => typeof obj[k] === "string" && (obj[k] as string).length > 0,
+	);
+	if (preferKey) return obj[preferKey] as string;
+	try {
+		return JSON.stringify(obj);
+	} catch {
+		return "";
+	}
+}
+
+/** Collapse whitespace and cap a line at `max` chars with an ellipsis. */
+function compactLine(text: string, max: number): string {
+	const collapsed = text.replace(/\s+/g, " ").trim();
+	if (collapsed.length <= max) return collapsed;
+	return `${collapsed.slice(0, max - 1)}…`;
+}
+
+/** Extract joined text from an assistant message's content blocks. */
+function extractAssistantTextFromContent(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.flatMap((c) =>
+			c && typeof c === "object" &&
+				(c as { type?: string }).type === "text"
+				? [(c as { text?: string }).text ?? ""]
+				: [],
+		)
+		.join("");
+}
+
+/**
+ * Build a stream-event forwarder that posts ralpi-stream messages (one chat
+ * line per tool start/end and assistant turn) into the chat. Only used when
+ * execution.chatStyle is "verbose".
+ */
+function makeStreamForwarder(pi: ExtensionAPI): (phase: string, event: import("@earendil-works/pi-coding-agent").AgentSessionEvent) => void {
+	const send = (details: {
+		kind: "tool-start" | "tool-end" | "tool-error" | "assistant";
+		phase: string;
+		toolName?: string;
+		body?: string;
+	}, fallback: string) => {
+		pi.sendMessage({
+			customType: "ralpi-stream",
+			content: fallback,
+			display: true,
+			details,
+		});
+	};
+
+	return (phase: string, event: import("@earendil-works/pi-coding-agent").AgentSessionEvent) => {
+		switch (event.type) {
+			case "tool_execution_start": {
+				const body = summarizeArgs(event.args);
+				send({ kind: "tool-start", phase, toolName: event.toolName, body }, `[${phase}] → ${event.toolName}${body ? `  ${body}` : ""}`);
+				return;
+			}
+			case "tool_execution_end": {
+				const body = compactLine(summarizeToolResult(event.result), 200);
+				const kind = event.isError ? "tool-error" : "tool-end";
+				const marker = event.isError ? "✗" : "←";
+				send({ kind, phase, toolName: event.toolName, body }, `[${phase}] ${marker} ${event.toolName}${body ? `  ${body}` : ""}`);
+				return;
+			}
+			case "message_end": {
+				const message = event.message as { role?: string; content?: unknown };
+				if (message.role !== "assistant") return;
+				const text = extractAssistantTextFromContent(message.content).trim();
+				if (!text) return;
+				const head = compactLine(text, 240);
+				send({ kind: "assistant", phase, body: head }, `[${phase}] ${head}`);
+				return;
+			}
+		}
+	};
+}
+
 // ─── Extension Entry ────────────────────────────────────────────────────────
 
 export default function ralpiLoopExtension(pi: ExtensionAPI): void {
+	// Wire the verbose stream forwarder — posts each tool event as its own
+	// chat message via the ralpi-stream renderer. Enabled per-run by
+	// `execution.chatStyle: verbose` in the config YAML.
+	setStreamForwarder(makeStreamForwarder(pi));
+
 	// Register custom message renderer for ralpi progress messages.
 	// Renders an expandable tool-call tree: collapsed shows last 3 + "N more",
 	// expanded (Ctrl+O) shows every tool call.
@@ -569,6 +694,73 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 			const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
 			box.addChild(new Text(text, 0, 0));
 			return box;
+		},
+	);
+
+	// ─── Verbose tool-event stream renderer ─────────────────────────────
+	//
+	// When execution.chatStyle is "verbose", each tool_execution_start/end and
+	// assistant turn is posted as its own chat message — the piolium/pygienium
+	// per-event stream. When "compact" (default), only the completion message
+	// with its expandable tool-call tree shows (the existing ralpi-progress
+	// renderer above).
+
+	type StreamLineKind = "tool-start" | "tool-end" | "tool-error" | "assistant";
+
+	interface StreamLineDetails {
+		kind: StreamLineKind;
+		phase: string;
+		toolName?: string;
+		body?: string;
+	}
+
+	pi.registerMessageRenderer<StreamLineDetails>(
+		"ralpi-stream",
+		(message, _options, theme) => {
+			const details = message.details;
+			if (!details || typeof details !== "object") {
+				const fallback =
+					typeof message.content === "string" ? message.content : "";
+				return new Text(theme.fg("muted", fallback), 0, 0);
+			}
+			const { kind, phase, toolName, body } = details;
+			const phaseTag = theme.fg("accent", `[${phase}]`);
+			const indent = " ".repeat(phase.length + 3);
+			let line: string;
+			switch (kind) {
+				case "tool-start": {
+					const arrow = theme.fg("muted", "→");
+					const name = theme.fg("toolTitle", theme.bold(toolName ?? ""));
+					const args = body ? ` ${theme.fg("muted", body)}` : "";
+					line = `${phaseTag} ${arrow} ${name}${args}`;
+					break;
+				}
+				case "tool-end": {
+					const arrow = theme.fg("success", "←");
+					const result = body
+						? ` ${theme.fg("dim", body)}`
+						: ` ${theme.fg("dim", "(ok)")}`;
+					line = `${indent}${arrow}${result}`;
+					break;
+				}
+				case "tool-error": {
+					const marker = theme.fg("error", "✗");
+					const result = body
+						? ` ${theme.fg("error", body)}`
+						: ` ${theme.fg("error", "failed")}`;
+					line = `${indent}${marker}${result}`;
+					break;
+				}
+				case "assistant":
+					line = `${phaseTag} ${theme.fg("muted", body ?? "")}`;
+					break;
+				default:
+					line =
+						typeof message.content === "string"
+							? theme.fg("muted", message.content)
+							: "";
+			}
+			return new Text(line, 0, 0);
 		},
 	);
 

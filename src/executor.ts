@@ -12,6 +12,7 @@ import type { ProgressTracker } from "./progress";
 import type {
 	ExtensionContext,
 	ModelRuntime,
+	AgentSessionEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
 	buildTaskPrompt,
@@ -55,6 +56,28 @@ import {
 	formatDuration,
 } from "./utils";
 import { updateTaskInFile } from "./parser";
+
+// ─── Stream Forwarder (verbose chat style) ────────────────────────────────────
+
+/**
+ * Module-level callback for verbose per-event chat streaming. Set by
+ * `index.ts` at extension startup via {@link setStreamForwarder} when the
+ * config's `execution.chatStyle` is "verbose". `runTask`'s event callback
+ * checks this and forwards each tool_execution_start/end + message_end as
+ * its own chat message — the piolium/pygienium per-event stream. When null
+ * (compact mode, the default), only the completion message with its
+ * expandable tool-call tree shows.
+ */
+let _streamForwarder:
+	| ((phase: string, event: AgentSessionEvent) => void)
+	| null = null;
+
+/** Register the verbose stream forwarder (called by index.ts at startup). */
+export function setStreamForwarder(
+	fn: ((phase: string, event: AgentSessionEvent) => void) | null,
+): void {
+	_streamForwarder = fn;
+}
 
 /** Optional callback to post a progress message into the chat history. */
 export type SendChatMessage = (
@@ -336,6 +359,10 @@ export async function runTask(
 		projectDir,
 		timeoutMs,
 		(event) => {
+			// Forward to the verbose stream when enabled.
+			if (_streamForwarder && config.execution.chatStyle === "verbose") {
+				_streamForwarder(`${task.id} · ${task.title}`, event);
+			}
 			if (event.type === "tool_execution_start") {
 				const label = formatToolArg(event.toolName, event.args);
 				toolCalls.push({
