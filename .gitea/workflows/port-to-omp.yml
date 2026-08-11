@@ -33,8 +33,8 @@ jobs:
           set -euo pipefail
           # Trim the secret: a stray newline from pasting silently breaks
           # oauth2 basic-auth. Fail loudly when it is missing entirely.
+          : "${PORTING_TOKEN:?PORTING_TOKEN secret is not set}" || exit 1
           PORTING_TOKEN="$(printf '%s' "${PORTING_TOKEN}" | tr -d '[:space:]')"
-          : "${PORTING_TOKEN:?PORTING_TOKEN secret is not set}"
           URL="https://oauth2:${PORTING_TOKEN}@git.freno.me/Mike/${OMP_REPO}.git"
           # The omp checkout lives in $RUNNER_TEMP, outside the pi checkout:
           # the port script refuses to write into a subdirectory of its own
