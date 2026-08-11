@@ -1,19 +1,22 @@
 name: port-to-omp
 
-# Regenerate the omp port of ralpi from this repo and push it to Mike/omp-ralpi.
+# Regenerate the omp port of ralpi from this repo and push it to
+# Mike/omp-ralpi.
 #
 # Prerequisites on git.freno.me:
-#   - an access token with write:repository scope, stored as the repo/org
-#     secret PORTING_TOKEN (the workflow authenticates as `oauth2:<token>` over
-#     https)
+#   - an access token with write:repository scope, stored as the repo secret
+#     PORTING_KEY (the workflow authenticates as https://Mike:<token>@…)
 #   - a registered Actions runner (act_runner) for this repo
+#   - the omp repo must exist (Mike/omp-ralpi)
 #
+# Manual run: Actions tab → Run workflow (workflow_dispatch), or push.
 # Safe by construction: the port commit lands in the omp repo, never here, so
 # this workflow cannot re-trigger itself.
 
 on:
   push:
     branches: [master]
+  workflow_dispatch:
 
 jobs:
   port:
@@ -27,30 +30,30 @@ jobs:
 
       - name: Port to omp
         env:
-          PORTING_TOKEN: ${{ secrets.PORTING_TOKEN }}
+          PORTING_KEY: ${{ secrets.PORTING_KEY }}
           OMP_REPO: omp-ralpi
         run: |
           set -euo pipefail
           # Trim the secret: a stray newline from pasting silently breaks
-          # oauth2 basic-auth. Fail loudly when it is missing entirely.
-          : "${PORTING_TOKEN:?PORTING_TOKEN secret is not set}" || exit 1
-          PORTING_TOKEN="$(printf '%s' "${PORTING_TOKEN}" | tr -d '[:space:]')"
-          URL="https://oauth2:${PORTING_TOKEN}@git.freno.me/Mike/${OMP_REPO}.git"
+          # basic auth. Fail loudly when it is missing entirely.
+          PORTING_KEY="$(printf '%s' "${PORTING_KEY}" | tr -d '[:space:]')"
+          : "${PORTING_KEY:?PORTING_KEY secret is not set}" || exit 1
+          URL="https://Mike:${PORTING_KEY}@git.freno.me/Mike/${OMP_REPO}.git"
+
           # The omp checkout lives in $RUNNER_TEMP, outside the pi checkout:
           # the port script refuses to write into a subdirectory of its own
           # source (cpSync would recurse into itself).
           PORT_DIR="${RUNNER_TEMP:-/tmp}/omp-port"
 
-          if git ls-remote "$URL" HEAD >/dev/null 2>&1; then
-            git clone --depth 1 "$URL" "$PORT_DIR"
-            git -C "$PORT_DIR" config user.name  "omp-port"
-            git -C "$PORT_DIR" config user.email "omp-port@freno.me"
-          else
-            git init -b main "$PORT_DIR"
-            git -C "$PORT_DIR" remote add origin "$URL"
-            git -C "$PORT_DIR" config user.name  "omp-port"
-            git -C "$PORT_DIR" config user.email "omp-port@freno.me"
+          # Preflight: reach the omp repo with the token. Fail with a clear
+          # message instead of a confusing error later at push time.
+          if ! git ls-remote "$URL" HEAD >/dev/null 2>&1; then
+            echo "::error::cannot read Mike/omp-ralpi with PORTING_KEY — is the secret set on this repo, valid, and write:repository-scoped?"
+            exit 1
           fi
+          git clone --depth 1 "$URL" "$PORT_DIR"
+          git -C "$PORT_DIR" config user.name  "omp-port"
+          git -C "$PORT_DIR" config user.email "omp-port@freno.me"
 
           # Regenerate the port directly into the omp checkout. The script
           # preserves .git, asserts every patch rule, and runs `bun install`
