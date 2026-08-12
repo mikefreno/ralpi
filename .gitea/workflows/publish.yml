@@ -1,0 +1,51 @@
+name: publish
+
+# Publish this package and its omp port to the npm registry on version tags.
+#
+# Prerequisites on npmjs.com / git.freno.me:
+#   - an npm automation token (publish scope) stored as the repo secret
+#     NPM_TOKEN (consumed via actions/setup-node registry auth)
+#   - the scoped package names claimed on npm (@mikefreno/<name> and
+#     @mikefreno/omp-<name>)
+#
+# Both packages ship TypeScript sources — nothing is built — so lifecycle
+# scripts (prepublishOnly tsc) are skipped: the port workflow already
+# typechecks the generated port against the pinned @oh-my-pi SDK, and the pi
+# package typechecks against the global pi SDK that CI does not install.
+#
+# Manual publish: Actions tab → Run workflow (workflow_dispatch).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup node (npm registry auth)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish pi package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --ignore-scripts
+
+      - name: Port to omp
+        run: bun port-to-omp.mjs --out "$RUNNER_TEMP/omp-port"
+
+      - name: Publish omp package
+        working-directory: ${{ runner.temp }}/omp-port
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --ignore-scripts
