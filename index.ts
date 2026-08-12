@@ -306,9 +306,10 @@ async function executePlanBatches(
 		);
 	}
 
-	// Write loop-active marker so a session reload can detect an interrupted
-	// loop and resume it (in-process agent sessions die on reload — the marker
-	// + progress.json in_progress tasks are the signal to re-run them).
+	// Write the loop-active marker so an interrupted loop can be resumed
+	// non-interactively via /ralpi-resume: it snapshots the execution mode and
+	// loop options (autoCommit/autoReview/saveReviews) that /ralpi-resume
+	// would otherwise re-prompt for.
 	if (projectDir) {
 		const allTaskIds = plan.batches.flatMap((b) => b.tasks.map((t) => t.id));
 		writeLoopActive(projectDir, {
@@ -764,237 +765,6 @@ export default function ralpiLoopExtension(pi: ExtensionAPI): void {
 		},
 	);
 
-	// ─── Reload detection: resume interrupted loops when session reloads ──
-	//
-	// ralpi runs task agent sessions in-process (createAgentSession), so they
-	// do NOT survive a /reload. When the new session starts, this handler
-	// reads the persisted loop-active marker + progress.json: if any task is
-	// still `in_progress`, the loop was interrupted mid-task and we resume it
-	// (resetting those tasks to pending so the DAG re-schedules them), using
-	// the mode + loop options snapshotted in loop-active.json so the resume is
-	// non-interactive.
-	pi.on("session_start", async (event, ctx) => {
-		if (event.reason !== "reload") return;
-
-		// Find the ralpi project directory
-		const projectDir = findRalpiDir(ctx.cwd);
-		if (!projectDir) return;
-
-		// Check if a task execution loop was active before the reload
-		const loopState = readLoopActive(projectDir);
-		if (!loopState) return;
-
-		// The auto-resume path has no CLI flag, so the gitignore guard is
-		// always on: keep `.ralpi/` out of the user's repo on reload too.
-		ensureRalpiIgnored(projectDir);
-
-		// Load progress state
-		const progressPath = path.join(projectDir, ".ralpi", "progress.json");
-
-		/** Re-read progress from disk. */
-		const readTasks = (): Record<string, { status: string }> | null => {
-			try {
-				const raw = fs.readFileSync(progressPath, "utf-8");
-				const parsed = JSON.parse(raw) as Record<string, any>;
-				return parsed.prds?.[loopState.prdKey]?.tasks ?? parsed.tasks ?? null;
-			} catch {
-				return null;
-			}
-		};
-
-		// ralpi agent sessions run in-process (createAgentSession), so they do
-		// NOT survive a session reload. Any task left `in_progress` is therefore
-		// stalled — its agent died with the previous session. Detect that state
-		// and actively resume the loop instead of passively polling (which would
-		// spin forever waiting for a dead task to complete).
-		const initialTasks = readTasks();
-		if (initialTasks) {
-			const inProgressIds = Object.entries(initialTasks).flatMap(([id, t]) =>
-				t.status === "in_progress" ? [id] : [],
-			);
-
-			// Build the sendProgress wrapper so resumed task messages render the
-			// same expandable tool-call tree as an interactive run. Defined before
-			// the finalize path below so it can report self-healed merges.
-			const sendProgress: SendChatMessage = (
-				content: string,
-				meta?: {
-					toolCalls?: Array<{ name: string; label: string }>;
-					reviewText?: string;
-					reviewPath?: string;
-					reviewResult?: ReviewResult;
-				},
-			) => {
-				pi.sendMessage({
-					customType: "ralpi-progress",
-					content,
-					display: true,
-					details: {
-						phase: "progress",
-						toolCalls: meta?.toolCalls,
-						reviewText: meta?.reviewText,
-						reviewPath: meta?.reviewPath,
-						reviewResult: meta?.reviewResult,
-					},
-				});
-			};
-
-			if (inProgressIds.length === 0) {
-				// Nothing was mid-flight — the loop either finished cleanly between
-				// the reload landing and this handler running, or was stopped
-				// between tasks. Either way, committed worktree branches from an
-				// interrupted loop may still be unmerged (e.g. a prior resume
-				// attempt reset tasks to pending before it was itself interrupted).
-				// Finalize those first so committed code lands in the workspace,
-				// persist the state to progress.json, update the PRD file, THEN
-				// clean up the stale marker.
-				try {
-					const config = loadConfig(projectDir);
-					// Clear any half-done merge left by an interrupted
-					// conflict-resolution session (it would block every merge below).
-					abortMerge(projectDir);
-					const allIds = Object.entries(initialTasks).flatMap(([id, t]) =>
-						t.status !== "failed" && t.status !== "pending" ? [id] : [],
-					);
-					const fin = finalizeCommittedWorktrees(
-						projectDir,
-						config.paths.stateDir,
-						loopState.prdKey,
-						allIds,
-					);
-					// Persist finalized tasks to progress.json + PRD file so the
-					// state is correct for subsequent /ralpi resume calls.
-					const stateDir = config.paths.stateDir;
-					const progressPath = path.join(projectDir, stateDir, "progress.json");
-					// Batch-update progress.json and PRD file for all finalized tasks
-					if (fin.finalized.length > 0) {
-						const progressRaw = fs.existsSync(progressPath)
-							? JSON.parse(fs.readFileSync(progressPath, "utf-8"))
-							: null;
-						for (const id of fin.finalized) {
-							sendProgress?.(
-								`✓ ${id} — finalized on resume (committed branch merged into main)`,
-							);
-							if (progressRaw) {
-								const tasks =
-									progressRaw.prds?.[loopState.prdKey]?.tasks ??
-									progressRaw.tasks;
-								if (tasks && tasks[id]) {
-									tasks[id].status = "completed";
-									tasks[id].completedAt = new Date().toISOString();
-								}
-							}
-							try {
-								const prdPath = loopState.taskFile;
-								if (fs.existsSync(prdPath)) {
-									updateTaskInFile(prdPath, id, "completed");
-								}
-							} catch {
-								// Best-effort
-							}
-						}
-						if (progressRaw) {
-							fs.writeFileSync(
-								progressPath,
-								JSON.stringify(progressRaw, null, 2),
-								"utf-8",
-							);
-						}
-					}
-					// ── Handle conflicted tasks ──
-					// Same logic as resumeLoop: reset to pending so the DAG can
-					// re-schedule them, keep the worktree for in-place re-run.
-					const conflictIds = Object.keys(fin.conflicts);
-					if (conflictIds.length > 0) {
-						const detail = conflictIds
-							.map((id) => `${id}: ${fin.conflicts[id].slice(0, 3).join(", ")}`)
-							.join("; ");
-						// Batch-reset all conflicted tasks to pending, then write once
-						const progressRaw = fs.existsSync(progressPath)
-							? JSON.parse(fs.readFileSync(progressPath, "utf-8"))
-							: null;
-						for (const id of conflictIds) {
-							if (progressRaw) {
-								const tasks =
-									progressRaw.prds?.[loopState.prdKey]?.tasks ??
-									progressRaw.tasks;
-								if (tasks && tasks[id]) {
-									tasks[id].status = "pending";
-									delete tasks[id].startedAt;
-									delete tasks[id].error;
-								}
-							}
-							try {
-								const prdPath = loopState.taskFile;
-								if (fs.existsSync(prdPath)) {
-									updateTaskInFile(prdPath, id, "pending");
-								}
-							} catch {
-								// Best-effort
-							}
-						}
-						if (progressRaw) {
-							fs.writeFileSync(
-								progressPath,
-								JSON.stringify(progressRaw, null, 2),
-								"utf-8",
-							);
-						}
-						ctx.ui.notify(
-							`Reset ${conflictIds.length} conflicted task(s) to pending for re-execution (${detail})`,
-							"info",
-						);
-					}
-				} catch {
-					// Best-effort — the marker is removed either way; the worktrees
-					// stay on disk for a manual /ralpi-resume.
-				}
-				ctx.ui.notify(
-					"ralpi loop has no in-progress task to resume — marking complete.",
-					"info",
-				);
-				deleteLoopActive(projectDir);
-				return;
-			}
-
-			const taskCount = loopState.taskIds.length;
-			ctx.ui.notify(
-				`ralpi loop was interrupted by reload with ${inProgressIds.length} in-progress task(s). ` +
-					`Resuming execution (${taskCount} tasks, ${loopState.mode} mode)...`,
-				"info",
-			);
-
-			// Load config from the project directory so model + thinking level
-			// resolve the same way the interactive command handler does.
-			const config = loadConfig(projectDir);
-
-			try {
-				await resumeLoop(
-					ctx,
-					loopState.taskFile,
-					projectDir,
-					loopState.prdKey,
-					sendProgress,
-					config.model ?? ctx.model,
-					pi.getThinkingLevel(),
-					{
-						mode: loopState.mode,
-						autoCommit: loopState.autoCommit ?? config.execution.autoCommit,
-						autoReview: loopState.autoReview ?? config.execution.autoReview,
-						saveReviews: loopState.saveReviews ?? config.execution.saveReviews,
-						skipFinalStatus: false,
-					},
-				);
-			} catch (error) {
-				const msg = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(`ralpi auto-resume failed: ${msg}`, "error");
-				// Leave loop-active.json in place so the user can retry via
-				// /ralpi resume after addressing the underlying error.
-			}
-			return;
-		}
-	});
-
 	pi.registerCommand("ralpi", {
 		description:
 			"Execute tasks from a task file using DAG-based dependency resolution",
@@ -1118,38 +888,15 @@ async function handleRun(
 	const noGitignore = stripNoGitignore(args);
 	const taskFile = resolveTaskArg(args[0] || "README.md", ctx.cwd);
 
-	// If targeting a specific task file and there's existing progress for it,
-	// auto-resume instead of starting fresh
+	// A cancelled loop for this file is continued below AFTER re-prompting for
+	// settings — /ralpi-run never silently resumes with the old loop's
+	// settings (only /ralpi-resume does that). isResume below keeps the
+	// interrupted task's worktree so it continues rather than restarts.
 	const existingProgress = findProgressFile(ctx.cwd, taskFile);
-	if (existingProgress) {
-		return handleResume(
-			ctx,
-			args.slice(0, 1),
-			sendChatMessage,
-			parentModel,
-			parentThinkingLevel,
-		);
-	}
 
-	// No existing progress for this task — check for any progress at all
+	// Resolve the project root from any existing progress so running from a
+	// subdirectory still targets the loop's project.
 	const found = findProgressFile(ctx.cwd);
-	if (found && !args[0]) {
-		// Offer to resume instead of starting fresh
-		const shouldResume = await ctx.ui.select(
-			"Found existing ralpi progress. Resume?",
-			["Yes, resume", "No, start fresh"],
-		);
-
-		if (shouldResume?.startsWith("Yes")) {
-			return handleResume(
-				ctx,
-				[],
-				sendChatMessage,
-				parentModel,
-				parentThinkingLevel,
-			);
-		}
-	}
 
 	const projectDir = found ? path.dirname(path.dirname(found.path)) : ctx.cwd;
 	ensureIgnoredNote(projectDir, ctx, noGitignore);
@@ -1196,6 +943,7 @@ async function handleRun(
 		mode,
 		sendChatMessage,
 		projectDir,
+		!!existingProgress, // preserve in-progress worktrees from a cancelled loop
 	);
 
 	const state = progress.getState();
@@ -1217,11 +965,10 @@ async function handleRun(
 
 /**
  * Resume core: given a resolved task file, project dir, and PRD key,
- * build the remaining plan and execute it. Used by both the explicit
- * `/ralpi resume` command and the auto-resume on session reload.
+ * build the remaining plan and execute it.
  *
  * `mode` and loop options (`autoCommit`/`autoReview`/`saveReviews`) may be
- * passed to skip interactive prompts — this is how a reload resumes
+ * passed to skip interactive prompts — this is how /ralpi-resume resumes
  * non-interactively using the snapshot stored in loop-active.json.
  * When omitted, the user is prompted as usual.
  */
@@ -1477,8 +1224,8 @@ async function handleResume(
 
 	// Reuse the loop snapshot (mode + autoCommit/autoReview/saveReviews)
 	// persisted when the loop started, so an interrupted loop resumes
-	// non-interactively — matching the auto-resume-on-reload path. Only fall
-	// back to interactive prompts when no snapshot is present.
+	// non-interactively. Only fall back to interactive prompts when no
+	// snapshot is present.
 	const snapshot = readLoopActive(projectDir);
 	const loopOpts = (() => {
 		if (

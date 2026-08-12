@@ -343,18 +343,6 @@ const FILE_RULES = {
       label: "runAgentSession body",
     },
   ],
-  "index.ts": [
-    {
-      from: 'import type {\n\tExtensionAPI,\n\tExtensionContext,\n} from "@oh-my-pi/pi-coding-agent";',
-      to: 'import type {\n\tExtensionAPI,\n\tExtensionContext,\n\tSessionStartEvent,\n} from "@oh-my-pi/pi-coding-agent";',
-      label: "SessionStartEvent import",
-    },
-    {
-      from: '\tpi.on("session_start", async (event, ctx) => {\n\t\tif (event.reason !== "reload") return;',
-      to: '\tpi.on("session_start", async (event: SessionStartEvent, ctx) => {\n\t\t// omp\'s SessionStartEvent has no reason/reload field; the in_progress-task\n\t\t// check below already scopes recovery to genuinely interrupted loops (a\n\t\t// completed loop has no in_progress tasks), so recovery runs on any start\n\t\t// where a stalled loop marker exists.',
-      label: "session_start handler",
-    },
-  ],
   "src/executor.ts": [
     {
       from: 'import type {\n\tExtensionContext,\n\tModelRuntime,\n\tAgentSessionEvent,\n} from "@oh-my-pi/pi-coding-agent";',

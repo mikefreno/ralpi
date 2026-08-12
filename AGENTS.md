@@ -36,7 +36,7 @@ is unavailable).
 
 - `index.ts` — extension entry, command registration (`ralpi`, `ralpi-run`,
   `ralpi-plan`, `ralpi-resume`, `ralpi-reset`), execution-mode + loop-option
-  prompts, reload auto-resume via `session_start`, progress message renderer
+  prompts, progress message renderer
 - `src/` — all logic modules:
   - `parser.ts` — task file parsing (Fio/README numbered, phased, checkbox,
     YAML formats), dependency + parallel-group + timeout parsing,
@@ -69,17 +69,15 @@ is unavailable).
 All runtime state lives in `.ralpi/` in the **project directory** (not this extension directory):
 
 - `.ralpi/progress.json` — execution progress, supports multiple PRDs
-- `.ralpi/loop-active.json` — marker written while a loop runs; drives
-  auto-resume after a session reload
+- `.ralpi/loop-active.json` — marker written while a loop runs; snapshots the
+  mode + loop options so `/ralpi-resume` can continue non-interactively
 - `.ralpi/reflections/` — per-task reflection JSON files
 - `.ralpi/reviews/<prdKey>/` — full review output JSON (only when
   `saveReviews` is on)
+- `.ralpi/sessions/` — agent session JSONL files per task (persisted so an
+  interrupted task can be resumed from its prior conversation)
 - `.ralpi/prompts/` — generated prompts (timestamped, for debugging)
 - `.ralpi/config.yaml` — project-level config (optional)
-
-There is no `.ralpi/sessions/` directory anymore — full task output is shown
-inline via expandable `ralpi-progress` chat messages, and review output is
-persisted under `.ralpi/reviews/`.
 
 ## Task ID convention
 
@@ -93,8 +91,10 @@ use raw numeric IDs.
 - `/ralpi` — no args → show plan for `README.md`; first token looks like a
   path (`@path`, `./path`, `.md`, `.yaml`, etc.) → run; anything else →
   error suggesting the dash commands
-- `/ralpi-run [task-file]` — run tasks (auto-resumes when progress already
-  exists for the file; otherwise prompts for execution mode + loop options)
+- `/ralpi-run [task-file]` — run tasks (always prompts for execution mode +
+  loop options; a cancelled loop for the file is continued from its progress
+  with the newly chosen settings — it never silently resumes with the old
+  loop's settings, only `/ralpi-resume` does that)
 - `/ralpi-plan [prompt]` — loads the bundled `prompts/task-manager.md`
   template and sends it as a user message. Pi's `sendUserMessage()` sends
   with `expandPromptTemplates: false`, so the extension does its own
