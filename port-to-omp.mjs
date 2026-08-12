@@ -42,6 +42,7 @@ const OMP = join(HOME, ".omp", "agent", "extensions");
 
 const SKIP = new Set([
   "port-to-omp.mjs",
+  "release-tag.sh",
   ".gitea",
   ".github",
   "node_modules",
