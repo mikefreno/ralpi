@@ -124,6 +124,9 @@ Key config fields in `execution`:
 - `autoCommit` / `autoReview` / `saveReviews` — loop options (selectable at
   loop startup via `selectLoopOptions`; review is asked FIRST, commit is
   mandated when review is on)
+- `inactivityTimeoutMs` — hang detection: if no agent session event arrives
+  within this window (e.g. a bash subprocess that never returns), the task is
+  aborted (agent abort + bash subprocess kill). `0` = disabled (default)
 - `models` — slot-aware round-robin model list for parallel mode, with
   failover to the next model per task (only after exhausting same-model
   retries, see `maxSameModelAttempts`)

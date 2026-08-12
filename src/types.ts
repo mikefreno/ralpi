@@ -161,6 +161,10 @@ export interface TaskProgressInfo {
 	commitSummary?: string;
 	/** Number of review-fix re-execution attempts made (review-gated mode) */
 	reviewRetries?: number;
+	/** Path to the JSONL session file backing this task's agent session,
+	 *  persisted so a resume can reopen it and continue where the
+	 *  interrupted session left off. */
+	sessionFile?: string;
 }
 
 export interface ProgressState {
@@ -205,6 +209,11 @@ export interface RalpiConfig {
 	execution: {
 		/** Task execution timeout in milliseconds */
 		timeoutMs: number;
+		/** Inactivity timeout in milliseconds — if no agent session event
+		 *  arrives within this window, the task is considered hung (e.g. a
+		 *  bash subprocess that never returns) and the session is aborted.
+		 *  0 = disabled. */
+		inactivityTimeoutMs: number;
 		/** Maximum parallel tasks (0 = unlimited) */
 		maxParallel: number;
 		/** Round-robin model list for parallel tasks (empty = inherit parent model) */
@@ -301,6 +310,7 @@ export const DEFAULT_CONFIG: RalpiConfig = {
 	},
 	execution: {
 		timeoutMs: 0, // 0 = inherit Pi's own defaults (no ralpi-level timeout)
+		inactivityTimeoutMs: 0, // 0 = disabled (no inactivity hang detection)
 		maxParallel: 3,
 		models: [],
 		autoCommit: true,

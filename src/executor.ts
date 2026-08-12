@@ -245,6 +245,13 @@ export async function runTask(
 	/** Review feedback from a rejected review — injected when re-executing
 	 *  a task in review-gated mode so the agent knows what to fix. */
 	reviewFeedback?: ReviewResult,
+	/** Session JSONL from a prior interrupted run of this task. When set and
+	 *  readable, the agent session reopens it and continues from the prior
+	 *  conversation instead of starting fresh. */
+	resumeSessionFile?: string,
+	/** Called with the session file path as soon as the agent session is
+	 *  created, so the caller can persist it for a later resume. */
+	onSessionFile?: (sessionFile: string) => void,
 ): Promise<{
 	success: boolean;
 	reflection?: Reflection;
@@ -254,6 +261,12 @@ export async function runTask(
 	outputPreview?: string;
 	commitMessages?: string[];
 	commitSummary?: string;
+	/** Path to the JSONL session file backing this run (for resume). */
+	sessionFile?: string;
+	/** True when a resume was requested but the session could not be opened
+	 *  from the file — the caller should clear the stored session file so
+	 *  retries start fresh. */
+	resumeFailed?: boolean;
 }> {
 	const startMs = Date.now();
 
@@ -385,6 +398,9 @@ export async function runTask(
 		config.thinkingLevel,
 		false, // noSkills — task sessions need skills
 		(ctx.modelRegistry as any).runtime as ModelRuntime,
+		config.execution.inactivityTimeoutMs,
+		resumeSessionFile,
+		onSessionFile,
 	);
 
 	const durationMs = Date.now() - startMs;
@@ -409,6 +425,8 @@ export async function runTask(
 			success: false,
 			error: output.error,
 			durationMs,
+			sessionFile: output.sessionFile,
+			resumeFailed: output.resumeFailed,
 		};
 	}
 
@@ -439,6 +457,7 @@ export async function runTask(
 		outputPreview,
 		commitMessages,
 		commitSummary,
+		sessionFile: output.sessionFile,
 	};
 }
 
@@ -825,6 +844,12 @@ async function executeTask(
 		: null;
 	const worktreeDir = wt?.dir ?? projectDir;
 
+	// Session file from a prior interrupted run of this task. The first
+	// attempt reopens it so the agent continues with its prior conversation
+	// (tool calls, findings) instead of restarting from scratch; failover
+	// retries start fresh.
+	const resumeSessionFile = progress.getSessionFile(task.id);
+
 	while (modelAttempt < maxModelAttempts) {
 		// Model advancement happens in the cycling branch below (not here) so a
 		// same-model retry `continue` doesn't re-advance and accidentally swap
@@ -885,6 +910,11 @@ async function executeTask(
 				currentModel,
 				batchRender,
 				priorReview,
+				modelAttempt === 0 && sameModelAttempt === 0
+					? resumeSessionFile
+					: undefined,
+				(sessionFile) =>
+					progress.setSessionFile(task.id, sessionFile),
 			);
 
 			if (result.success) {
@@ -1009,6 +1039,7 @@ async function executeTask(
 									`review-${task.id}`,
 									config.execution.reviewTimeoutMs,
 									reviewModels,
+									config.execution.inactivityTimeoutMs,
 								);
 
 							if (!reviewResult.success) {
@@ -1301,6 +1332,7 @@ async function executeTask(
 					finalCommitSummary,
 					finalReview,
 					reviewRetries,
+					result.sessionFile,
 				);
 				// Auto-update the PRD source file checkbox
 				try {
@@ -1314,6 +1346,12 @@ async function executeTask(
 
 			// Agent session failed (provider error).
 			// Pi's built-in in-call retry already exhausted for this attempt.
+			// A resumed session that couldn't be opened (corrupt/missing
+			// JSONL) must not be retried — forget it so later attempts (and
+			// future resumes) start fresh.
+			if (result.resumeFailed) {
+				progress.setSessionFile(task.id, undefined);
+			}
 			// Reattempt on the SAME model a few more times before cycling — a
 			// transient outage can outlast pi's per-prompt backoff window.
 			sameModelAttempt++;
@@ -1446,6 +1484,8 @@ async function runFollowUpSession(
 	widgetKeySuffix: string,
 	timeoutMs: number,
 	models: unknown[],
+	/** Inactivity timeout for the session (see runAgentSession). */
+	inactivityTimeoutMs = 0,
 ): Promise<{
 	result: Awaited<ReturnType<typeof runAgentSession>>;
 	toolCalls: ToolCallEntry[];
@@ -1544,6 +1584,7 @@ async function runFollowUpSession(
 					config.thinkingLevel,
 					false, // noSkills=false — follow-up sessions load skills too
 					(ctx.modelRegistry as any).runtime as ModelRuntime,
+					inactivityTimeoutMs,
 				);
 
 				if (result.success) break;
@@ -1690,6 +1731,7 @@ async function runCommitSession(
 			`commit-${task.id}`,
 			config.execution.commitTimeoutMs,
 			commitModels,
+			config.execution.inactivityTimeoutMs,
 		);
 
 	if (commitResult.success) {
@@ -1862,6 +1904,7 @@ async function resolveConflictsSession(
 		`resolve-${task.id}`,
 		config.execution.commitTimeoutMs,
 		models,
+		config.execution.inactivityTimeoutMs,
 	);
 
 	if (!result.success) {

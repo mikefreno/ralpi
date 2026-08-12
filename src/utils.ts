@@ -611,6 +611,18 @@ export async function runAgentSession(
    *  rate-limit normalization) are available. When omitted, the SDK creates
    *  a fresh runtime from models.json only — extension providers are lost. */
   modelRuntime?: ModelRuntime,
+  /** Inactivity timeout in milliseconds — if no agent session event arrives
+   *  within this window, the task is considered hung (e.g. a bash subprocess
+   *  that never returns) and the session is aborted. 0 = disabled. */
+  inactivityTimeoutMs = 0,
+  /** Existing session JSONL file to resume. The session reopens the file and
+   *  appends to it, so the agent sees the full prior conversation and can
+   *  continue rather than redo prior tool calls. When the file is missing,
+   *  a fresh session is created instead (with a warning). */
+  resumeSessionFile?: string,
+  /** Called with the session file path as soon as the session is created, so
+   *  callers can persist it for resume before the session completes. */
+  onSessionFile?: (sessionFile: string) => void,
 ): Promise<{
   success: boolean;
   text: string;
@@ -618,6 +630,13 @@ export async function runAgentSession(
   toolUsage: ToolUsage;
   stopReason?: string;
   events: AgentSessionEvent[];
+  /** Path to the JSONL session file backing this session (set once the
+   *  session is created; enables resume). */
+  sessionFile?: string;
+  /** True when a resume was requested but the session could not be created
+   *  from the file (corrupt/unreadable JSONL). Callers should clear the
+   *  stored session file so retries start fresh. */
+  resumeFailed?: boolean;
 }> {
   const toolUsage: ToolUsage = {
     read: 0,
@@ -638,6 +657,16 @@ export async function runAgentSession(
     session?: Awaited<ReturnType<typeof createAgentSession>>["session"];
   } = {};
 
+  let sessionFile: string | undefined;
+  let sessionCreated = false;
+  // Inactivity watchdog: aborts the session when no events arrive within
+  // inactivityTimeoutMs. The SDK emits an event for every tool start/end/
+  // update and message start/end, so silence means the agent is stuck
+  // (typically a hung bash subprocess producing no output).
+  let inactivityInterval: NodeJS.Timeout | null = null;
+  let inactivityAborted = false;
+  let lastEventTime = 0;
+
   try {
     // Loop sessions load the full normal pi context: extensions (so all
     // extension-provided tools register), skills, and project context
@@ -653,9 +682,30 @@ export async function runAgentSession(
     });
     await loader.reload();
 
+    // Persist sessions under the ralpi project's `.ralpi/sessions/` so they
+    // survive worktree removal and are findable from the main repo on resume.
+    // Worktrees live inside `<project>/.ralpi/worktrees/...`, so walking up
+    // from the agent's cwd always finds the main project's `.ralpi` first.
+    const ralpiDir = findRalpiDir(cwd);
+    const sessionDir = ralpiDir
+      ? path.join(ralpiDir, ".ralpi", "sessions")
+      : path.join(cwd, ".ralpi", "sessions");
+
+    let sessionManager: SessionManager;
+    if (resumeSessionFile && fs.existsSync(resumeSessionFile)) {
+      sessionManager = SessionManager.open(resumeSessionFile, sessionDir, cwd);
+    } else {
+      if (resumeSessionFile) {
+        console.warn(
+          `[ralpi] resume session file not found (${resumeSessionFile}) — starting a fresh session`,
+        );
+      }
+      sessionManager = SessionManager.create(cwd, sessionDir);
+    }
+
     const result = await createAgentSession({
       cwd,
-      sessionManager: SessionManager.inMemory(),
+      sessionManager,
       resourceLoader: loader,
       settingsManager: SettingsManager.create(cwd, getAgentDir()),
       modelRuntime,
@@ -663,7 +713,11 @@ export async function runAgentSession(
       model: model as any,
       thinkingLevel: thinkingLevel as any,
     });
+    sessionCreated = true;
     sessionRef.session = result.session;
+
+    sessionFile = result.session.sessionFile;
+    if (sessionFile) onSessionFile?.(sessionFile);
 
     // Wire external abort signal
     const abortHandler = () => result.session.agent.abort();
@@ -672,8 +726,26 @@ export async function runAgentSession(
     let finalText = "";
     let errorMessage: string | undefined;
     let stopReason: string | undefined;
+    lastEventTime = Date.now();
+
+    // Inactivity watchdog: check the silence window on an interval and abort
+    // (plus kill any hung bash subprocess) when it is exceeded.
+    if (inactivityTimeoutMs > 0) {
+      const intervalMs = Math.min(inactivityTimeoutMs, 5000);
+      inactivityInterval = setInterval(() => {
+        if (!sessionRef.session) return;
+        if (Date.now() - lastEventTime <= inactivityTimeoutMs) return;
+        inactivityAborted = true;
+        sessionRef.session.agent.abort();
+        sessionRef.session.abortBash();
+        errorMessage = `Task aborted: inactivity timeout (no events for ${Math.round(inactivityTimeoutMs / 1000)}s)`;
+        if (inactivityInterval) clearInterval(inactivityInterval);
+        inactivityInterval = null;
+      }, intervalMs);
+    }
 
     const unsubscribe = result.session.subscribe((event) => {
+      lastEventTime = Date.now();
       onEvent?.(event);
 
       if (event.type === "message_end") {
@@ -685,7 +757,10 @@ export async function runAgentSession(
         };
         if (message.role !== "assistant") return;
         if (message.stopReason) stopReason = message.stopReason;
-        if (message.errorMessage) errorMessage = message.errorMessage;
+        // Keep the inactivity-timeout message: the abort's own errorMessage
+        // would otherwise clobber the (more useful) hang explanation.
+        if (message.errorMessage && !inactivityAborted)
+          errorMessage = message.errorMessage;
         const text = extractAssistantText(message.content);
         if (text) finalText = text;
       }
@@ -718,6 +793,7 @@ export async function runAgentSession(
         toolUsage,
         stopReason,
         events: [], // streamed to file
+        sessionFile,
       };
     }
 
@@ -727,6 +803,7 @@ export async function runAgentSession(
       toolUsage,
       stopReason,
       events: [],
+      sessionFile,
     };
   } catch (error) {
     if (timeoutHandle) clearTimeout(timeoutHandle);
@@ -736,9 +813,14 @@ export async function runAgentSession(
       error: error instanceof Error ? error.message : String(error),
       toolUsage,
       events: [],
+      sessionFile,
+      // A requested resume that failed to open (corrupt/unreadable file)
+      // should not be retried — callers clear the stored file and go fresh.
+      resumeFailed: resumeSessionFile !== undefined && !sessionCreated,
     };
   } finally {
     sessionRef.session?.dispose();
+    if (inactivityInterval) clearInterval(inactivityInterval);
   }
 }
 

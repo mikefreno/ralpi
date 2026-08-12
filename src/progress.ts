@@ -185,11 +185,13 @@ export class ProgressTracker {
 	}
 
 	/** Mark a task as in progress */
-	markInProgress(taskId: string): void {
+	markInProgress(taskId: string, sessionFile?: string): void {
 		const prd = this.getPRD();
 		this.ensureTask(prd, taskId);
 		prd.tasks[taskId].status = "in_progress";
 		prd.tasks[taskId].startedAt = new Date().toISOString();
+		if (sessionFile !== undefined)
+			prd.tasks[taskId].sessionFile = sessionFile;
 		this.save();
 	}
 
@@ -204,6 +206,7 @@ export class ProgressTracker {
 		commitSummary?: string,
 		review?: ReviewResult,
 		reviewRetries?: number,
+		sessionFile?: string,
 	): void {
 		const prd = this.getPRD();
 		this.ensureTask(prd, taskId);
@@ -218,6 +221,7 @@ export class ProgressTracker {
 		if (review) prd.tasks[taskId].review = review;
 		if (reviewRetries !== undefined)
 			prd.tasks[taskId].reviewRetries = reviewRetries;
+		if (sessionFile !== undefined) prd.tasks[taskId].sessionFile = sessionFile;
 		this.save();
 	}
 
@@ -234,6 +238,22 @@ export class ProgressTracker {
 	getTaskStatus(taskId: string): Task["status"] {
 		const prd = this.getPRD();
 		return prd.tasks[taskId]?.status ?? "pending";
+	}
+
+	/** Get the persisted session file path for a task (for resume), if any. */
+	getSessionFile(taskId: string): string | undefined {
+		const prd = this.getPRD();
+		return prd.tasks[taskId]?.sessionFile;
+	}
+
+	/** Persist the session file path for a task without changing its status.
+	 *  Called as soon as an agent session is created so an interrupted run
+	 *  can be resumed from the JSONL history. Pass undefined to clear. */
+	setSessionFile(taskId: string, sessionFile: string | undefined): void {
+		const prd = this.getPRD();
+		this.ensureTask(prd, taskId);
+		prd.tasks[taskId].sessionFile = sessionFile;
+		this.save();
 	}
 
 	/** Get IDs of all completed tasks */
