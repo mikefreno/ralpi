@@ -936,6 +936,10 @@ async function executeTask(
 						// A FAILED range computation (broken/stale base ref, git error) is
 						// logged as a distinct warning and is never treated as a clean,
 						// verified task — only a GENUINE "no changes" skips review.
+						// Accumulated rejected reviews from earlier passes — injected
+						// into the next review prompt so the reviewer sees prior
+						// findings and can verify they were addressed.
+						const priorReviews: ReviewResult[] = [];
 						while (true) {
 							if (!baseRef) {
 								sendChatMessage?.(
@@ -973,16 +977,17 @@ async function executeTask(
 								reviewInfo.hash,
 								reviewInfo.subject,
 								reviewInfo.diff,
-								{
-									projectContext: config.prompts.projectContext,
-									focus: config.prompts.reviewFocus,
-									diffOptions: {
-										extraPatterns: compileIgnorePatterns(
-											config.review.extraIgnorePatterns,
-										),
-										ignorePaths: config.review.ignorePaths,
-									},
+							{
+								projectContext: config.prompts.projectContext,
+								focus: config.prompts.reviewFocus,
+								priorReviews,
+								diffOptions: {
+									extraPatterns: compileIgnorePatterns(
+										config.review.extraIgnorePatterns,
+									),
+									ignorePaths: config.review.ignorePaths,
 								},
+							},
 							);
 
 							const reviewModel = resolveFollowUpModel(
@@ -1097,6 +1102,9 @@ async function executeTask(
 								break; // changes already committed — merge proceeds
 							}
 
+							// Accumulate the rejected review so the next review pass
+							// sees prior findings and can verify they were addressed.
+							if (review) priorReviews.push(review);
 							attempt++;
 							reviewRetries++;
 							sendChatMessage?.(
@@ -1779,6 +1787,52 @@ async function resolveConflictsSession(
 		return;
 	}
 
+	// Merge failed but produced no unmerged paths — no real conflicts to
+	// resolve. This can happen when the branch tip was already merged by the
+	// first attempt (mergeWorktree) before it aborted, or when the merge
+	// fails for a non-conflict reason (dirty index, stale ref). Don't spawn
+	// an agent session for zero conflicts — abort or complete and finish.
+	if (attempt.conflicts.length === 0) {
+		// Try to complete whatever merge state exists; if there's nothing to
+		// commit, abort to leave the working tree clean.
+		if (completeMerge(projectDir)) {
+			sendChatMessage?.(
+				`✓ conflicts auto-resolved for ${task.id} · ${task.title}`,
+			);
+			removeWorktree(projectDir, worktree);
+			progress.markCompleted(
+				task.id,
+				0,
+				undefined,
+				undefined,
+				undefined,
+				[],
+				"",
+				undefined,
+				0,
+			);
+			try {
+				updateTaskInFile(project.sourcePath, task.id, "completed");
+			} catch {
+				// Best-effort
+			}
+			return;
+		}
+		abortMerge(projectDir);
+		sendChatMessage?.(
+			`~ conflict resolution for ${task.id} · ${task.title} — merge produced no conflicts but could not be completed`,
+		);
+		progress.markFailed(
+			task.id,
+			`Merge of ${branch} produced no conflicts but could not be completed`,
+		);
+		try {
+			updateTaskInFile(project.sourcePath, task.id, "failed");
+		} catch {
+			// Best-effort
+		}
+		return;
+	}
 	// Conflicts exist — spawn a resolution agent session.
 	const prompt = buildConflictResolutionPrompt(
 		task,

@@ -29,6 +29,12 @@ export interface ReviewPromptOptions {
 	focus?: string;
 	/** Noise-filter overrides (config.review.*). */
 	diffOptions?: DiffOptions;
+	/** Prior review results from earlier passes in a review-gated loop.
+	 *  Each rejected review is injected into the next review prompt so the
+	 *  reviewer can verify prior findings were addressed and catch new
+	 *  regressions introduced by the fix attempt — instead of re-reviewing
+	 *  from scratch. */
+	priorReviews?: ReviewResult[];
 }
 
 // ─── Task Prompt ─────────────────────────────────────────────────────────────
@@ -258,8 +264,12 @@ export function buildReviewPrompt(
 	parts.push(renderDiffSection(summary, filtered, "### Diff"));
 	parts.push("");
 
-	// ── Custom Review Focus ──
+	// ── Prior Review History (review-gated re-review) ──
 
+	parts.push(renderPriorReviews(opts.priorReviews ?? []));
+	if (opts.priorReviews && opts.priorReviews.length > 0) parts.push("");
+
+	// ── Custom Review Focus ──
 	if (opts.focus) {
 		parts.push("## Custom Review Focus");
 		parts.push(opts.focus);
@@ -360,7 +370,11 @@ export function buildReviewPromptUncommitted(
 	parts.push(
 		renderDiffSection(summary, filtered, "### Current Tracked Diff (git diff)"),
 	);
-	parts.push("");
+
+	// ── Prior Review History (review-gated re-review) ──
+
+	parts.push(renderPriorReviews(opts.priorReviews ?? []));
+	if (opts.priorReviews && opts.priorReviews.length > 0) parts.push("");
 
 	// ── Custom Review Focus ──
 
@@ -466,6 +480,45 @@ function renderDiffSection(
 	lines.push("```diff");
 	lines.push(filtered || "(no included changes)");
 	lines.push("```");
+	return lines.join("\n");
+}
+
+/**
+ * Render a "Prior Review History" section from earlier rejected reviews.
+ * Returns an empty string when there are no prior reviews so callers omit
+ * the section entirely.
+ *
+ * Each prior review's verdict, summary, and findings are listed so the
+ * reviewer can verify the developer addressed them and watch for new
+ * regressions — instead of re-reviewing from scratch on each pass.
+ */
+function renderPriorReviews(priorReviews: ReviewResult[]): string {
+	if (priorReviews.length === 0) return "";
+	const lines: string[] = [];
+	lines.push("## Prior Review History");
+	lines.push(
+		"Previous review pass(es) rejected this task. Verify each finding was",
+		"addressed in the current diff and watch for new regressions:",
+	);
+	lines.push("");
+	for (let i = 0; i < priorReviews.length; i++) {
+		const r = priorReviews[i];
+		if (!r) continue;
+		lines.push(`### Review ${i + 1} — ${r.verdict.toUpperCase()}`);
+		lines.push(`Summary: ${r.summary}`);
+		if (r.findings.length > 0) {
+			lines.push("Findings:");
+			for (const f of r.findings) {
+				const loc = f.file
+					? f.line
+						? ` (${f.file}:${f.line})`
+						: ` (${f.file})`
+					: "";
+				lines.push(`- [${f.severity}]${loc} ${f.message}`);
+			}
+		}
+		lines.push("");
+	}
 	return lines.join("\n");
 }
 
