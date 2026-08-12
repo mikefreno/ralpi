@@ -1,7 +1,17 @@
 name: port-to-omp
 
-# Regenerate the omp port of ralpi from this repo and push it to
-# Mike/omp-ralpi.
+# Keep the omp port of ralpi in lockstep with this repo.
+#
+# Two jobs:
+#   - verify: port to a scratch dir, then typecheck + test the ported tree on
+#     EVERY push and PR. Source drift — a base change that breaks a port op —
+#     fails here, on the branch that introduced it, before it reaches master.
+#     (The ported tree contains the full test suite, so this also gives the
+#     base repo its CI test coverage.)
+#   - publish: regenerate the omp port into Mike/omp-ralpi and push it, but
+#     only on master, and only after verify passed — a broken port can never
+#     ship. The port commit lands in the omp repo, never here, so this
+#     workflow cannot re-trigger itself.
 #
 # Prerequisites on git.freno.me:
 #   - an access token with write:repository scope, stored as the repo secret
@@ -10,16 +20,32 @@ name: port-to-omp
 #   - the omp repo must exist (Mike/omp-ralpi)
 #
 # Manual run: Actions tab → Run workflow (workflow_dispatch), or push.
-# Safe by construction: the port commit lands in the omp repo, never here, so
-# this workflow cannot re-trigger itself.
 
 on:
   push:
-    branches: [master]
-  workflow_dispatch:
+  pull_request:
 
 jobs:
-  port:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Port to scratch dir (drift check)
+        run: |
+          set -euo pipefail
+          bun port-to-omp.mjs --out "$RUNNER_TEMP/omp-port-check"
+          cd "$RUNNER_TEMP/omp-port-check"
+          bun run typecheck
+          bun test
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
