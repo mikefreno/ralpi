@@ -311,6 +311,11 @@ omp install @mikefreno/omp-ralpi
 This is the omp port of [Mike/ralpi](https://git.freno.me/Mike/ralpi), regenerated automatically from the source repo. See the source repo for full documentation.
 `;
 
+
+// publish workflow emitted into the port repo so the omp package can be
+// released independently (tag push or manual dispatch on the omp repo).
+const PORT_PUBLISH_WORKFLOW = "name: publish\n\n# Publish this omp port package to the npm registry on version tags.\n#\n# Prerequisites:\n#   - npm automation token (publish scope) stored as the repo secret NPM_TOKEN\n#   - package name claimed on npm (@mikefreno/omp-<name>)\n#\n# Manual publish: Actions tab → Run workflow (workflow_dispatch).\n\non:\n  push:\n    tags: ['v*']\n  workflow_dispatch:\n\njobs:\n  publish:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Checkout\n        uses: actions/checkout@v4\n\n      - name: Setup node (npm registry auth)\n        uses: actions/setup-node@v4\n        with:\n          node-version: '22'\n          registry-url: 'https://registry.npmjs.org'\n\n      - name: Publish\n        env:\n          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n        run: npm publish --access public --ignore-scripts\n";
+
 const FILE_RULES = {
   "src/utils.ts": [
     {
@@ -410,6 +415,10 @@ function portExtension() {
       writeFileSync(p, text);
     }
   }
+  const wfDir = join(dstDir, ".gitea", "workflows");
+  mkdirSync(wfDir, { recursive: true });
+  writeFileSync(join(wfDir, "publish.yml"), PORT_PUBLISH_WORKFLOW);
+
   console.log("== bun install (regenerates bun.lock + node_modules)");
   execSync("bun install", { cwd: dstDir, stdio: "inherit" });
   console.log("== done");
